@@ -744,6 +744,26 @@ fn main() {
         eprintln!("ts ok");
         return;
     }
+    if let Ok(m) = std::env::var("SPLIT") {
+        let ch = chunks(&csvs(&data.join("events")));
+        ch.par_iter().for_each(|&(d, _)| unsafe { libc::madvise((d.as_ptr() as usize & !4095) as *mut libc::c_void, d.len() + 4096, 22); });
+        lap("events mapped");
+        let n: usize = ch
+            .par_iter()
+            .map(|&(d, h)| {
+                let mut c = 0usize;
+                let mut b = Bk::new(d.len() / 70);
+                scan::<7>(d, h, |f| match m.as_str() {
+                    "scan" => c += f[0].len(),
+                    "event" => c += std::hint::black_box(event(f, &cx)).map_or(0, |e| e.ts as usize),
+                    _ => parse_event(f, &cx, &mut b),
+                });
+                c + b.len(0)
+            })
+            .sum();
+        lap(&format!("split {m} {n}"));
+        return;
+    }
     if std::env::var("LINKS").is_ok() {
         let (pm, nm) = persons(&csvs(&data.join("links")));
         lap(&format!("links only: {} ids, {} names", pm.s.len() / 2, nm.len()));
