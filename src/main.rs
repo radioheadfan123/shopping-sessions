@@ -504,6 +504,21 @@ fn epoch(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
+/// Per month from 1970-01 to 2099-12: days since 1970-01-01 to its first day << 8 | its length.
+static YM: [i64; 1560] = {
+    let mut t = [0i64; 1560];
+    let (mut i, mut days) = (0, 0i64);
+    while i < 1560 {
+        let (y, m) = (1970 + i as i64 / 12, i % 12);
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let n = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m];
+        t[i] = days << 8 | n;
+        days += n;
+        i += 1;
+    }
+    t
+};
+
 #[inline]
 fn iso(s: &[u8]) -> Option<i64> {
     // bytes 0..16 XOR the template: digit lanes must come out 0..9 and separator lanes 0, so
@@ -519,18 +534,22 @@ fn iso(s: &[u8]) -> Option<i64> {
     let g = |x: u64, i: usize| (x >> (8 * i)) as u8 as i64;
     let (y, mo, d) = (g(a, 0) * 1000 + g(a, 1) * 100 + g(a, 2) * 10 + g(a, 3), g(a, 5) * 10 + g(a, 6), g(b, 0) * 10 + g(b, 1));
     let (h, mi, se) = (g(b, 3) * 10 + g(b, 4), g(b, 6) * 10 + g(b, 7), d2(s, 17)?);
-    if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
-        return None;
-    }
-    const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    const CUM: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    if d > MD[mo as usize] + (leap && mo == 2) as i64 {
+    // one test, no early outs: every field is a digit pair, so these bounds are the whole check
+    if (mo.wrapping_sub(1) as u64 >= 12) | (d < 1) | (h > 23) | (mi > 59) | (se > 59) {
         return None;
     }
     let days = if (1970..2100).contains(&y) {
-        (y - 1970) * 365 + (y - 1969) / 4 + CUM[mo as usize] + (leap && mo > 2) as i64 + d - 1
+        let m = YM[((y - 1970) * 12 + mo - 1) as usize]; // days to month start << 8 | days in month
+        if d > m & 255 {
+            return None;
+        }
+        (m >> 8) + d - 1
     } else {
+        const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        if d > MD[mo as usize] + (leap && mo == 2) as i64 {
+            return None;
+        }
         days_from_civil(y, mo, d)
     };
     let mut t = ((days * 24 + h) * 60 + mi) * 60 + se;
@@ -1391,4 +1410,21 @@ fn write_camp(path: &Path, rows: &[(&[u8], &[u8], i32, [i64; 4])]) {
     }
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+#[test]
+fn iso_table() {
+    // every date and a few bad ones from 1965 to 2105 against days_from_civil
+    for y in 1965..2106i64 {
+        for mo in 0..14i64 {
+            for d in 0..33i64 {
+                let s = format!("{y:04}-{mo:02}-{d:02}T13:07:59Z");
+                let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+                let md = [0, 31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                let ok = (1..=12).contains(&mo) && d >= 1 && d <= md[mo as usize];
+                let want = ok.then(|| ((days_from_civil(y, mo, d) * 24 + 13) * 60 + 7) * 60 * 1000 + 59_000);
+                assert_eq!(parse_ts(s.as_bytes()), want, "{s}");
+            }
+        }
+    }
 }
