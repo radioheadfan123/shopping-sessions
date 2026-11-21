@@ -29,28 +29,90 @@ impl Hasher for IdH {
 }
 type Map<V> = HashMap<u64, V, BuildHasherDefault<IdH>>; // keys are already hashes
 
-#[inline]
-fn mix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
+/// Flat open-addressing u64 -> u64 table, one cache line per probe, so lookups can be prefetched.
+/// Key 0 marks an empty slot; a real 0 key is stored as 1 (a 2^-64 merge, below the hash's own collision odds).
+struct Tab {
+    s: Vec<(u64, u64)>,
+    mask: usize,
+}
+impl Tab {
+    fn new(n: usize) -> Tab {
+        let cap = (n * 2).next_power_of_two().max(16);
+        Tab { s: vec![(0, 0); cap], mask: cap - 1 }
+    }
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        k.max(1) as usize & self.mask
+    }
+    fn insert(&mut self, k: u64, v: u64) {
+        let (k, mut i) = (k.max(1), self.slot(k));
+        while self.s[i].0 != 0 && self.s[i].0 != k {
+            i = (i + 1) & self.mask;
+        }
+        self.s[i] = (k, v);
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> Option<u64> {
+        let (k, mut i) = (k.max(1), self.slot(k));
+        loop {
+            let (a, v) = self.s[i];
+            if a == k {
+                return Some(v);
+            }
+            if a == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        use std::arch::x86_64::*;
+        unsafe { _mm_prefetch(self.s.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0) }
+    }
+}
+const PF: usize = 16; // prefetch distance in rows
+
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = a as u128 * b as u128;
+    r as u64 ^ (r >> 64) as u64
+}
+#[inline(always)]
+fn r4(s: &[u8], i: usize) -> u64 {
+    u32::from_le_bytes(s[i..i + 4].try_into().unwrap()) as u64
+}
+#[inline(always)]
+fn r8(s: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
 }
 
-/// 64-bit string hash. ponytail: 64 bits, so ~1e-4 odds of one event_id collision at 60M events; 128 bits if that ever bites.
+/// 64-bit string hash (wyhash's short-input path). ponytail: 64 bits, so ~1e-4 odds of one event_id
+/// collision at 60M events; 128 bits if that ever bites.
 #[inline]
 fn hash(s: &[u8]) -> u64 {
-    let mut h = (s.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut c = s.chunks_exact(8);
-    for w in &mut c {
-        h = mix(h ^ u64::from_le_bytes(w.try_into().unwrap()));
-    }
-    let r = c.remainder();
-    if !r.is_empty() {
-        let mut b = [0u8; 8];
-        b[..r.len()].copy_from_slice(r);
-        h = mix(h ^ u64::from_le_bytes(b));
-    }
-    mix(h)
+    const S0: u64 = 0xa076_1d64_78bd_642f;
+    const S1: u64 = 0xe703_7ed1_a0b4_28db;
+    let n = s.len();
+    let mut seed = S0;
+    let (a, b) = if n <= 16 {
+        if n >= 4 {
+            let q = (n >> 3) << 2;
+            (r4(s, 0) << 32 | r4(s, q), r4(s, n - 4) << 32 | r4(s, n - 4 - q))
+        } else if n > 0 {
+            ((s[0] as u64) << 16 | (s[n >> 1] as u64) << 8 | s[n - 1] as u64, 0)
+        } else {
+            (0, 0)
+        }
+    } else {
+        let mut i = 0;
+        while n - i > 16 {
+            seed = mum(r8(s, i) ^ S1, r8(s, i + 8) ^ seed);
+            i += 16;
+        }
+        (r8(s, n - 16), r8(s, n - 8))
+    };
+    mum(S1 ^ n as u64, mum(a ^ S1, b ^ seed))
 }
 
 /// A string inside a leaked mmap, packed as pointer | len << 48.
@@ -422,7 +484,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
 }
 
 /// Links -> (id hash -> person key, person key -> name loc). Person key = hash of the person's name.
-fn persons(files: &[&'static [u8]]) -> (Map<u64>, Map<u64>) {
+fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
     let pairs: Vec<(u64, u64)> = chunks(files)
         .par_iter()
         .flat_map_iter(|&(d, h)| {
@@ -466,9 +528,8 @@ fn persons(files: &[&'static [u8]]) -> (Map<u64>, Map<u64>) {
             best[r] = x;
         }
     }
-    let mut pmap: Map<u64> = Map::default();
+    let mut pmap = Tab::new(n);
     let mut names: Map<u64> = Map::default();
-    pmap.reserve(n);
     for x in 0..n {
         let name = locs[best[find(&mut parent, x as u32) as usize] as usize];
         let key = hash(at(name));
@@ -551,7 +612,7 @@ fn main() {
         },
     );
     lap("links + events parsed");
-    let person = |u: u64| *pmap.get(&u).unwrap_or(&u);
+    let person = |u: u64| pmap.get(u).unwrap_or(u);
 
     // 2: clicks by person; events deduped, then by person
     let (cl, s2) = rayon::join(
@@ -559,7 +620,7 @@ fn main() {
             chunks(&csvs(&data.join("clicks")))
                 .par_iter()
                 .map(|&(d, h)| {
-                    let mut b: Vec<Vec<Cl>> = bucket(d.len() / 50);
+                    let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
                     scan::<4>(d, h, |f| {
                         if f[0].is_empty() || f[1].is_empty() {
                             return;
@@ -569,9 +630,17 @@ fn main() {
                             return;
                         }
                         let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
-                        let p = person(hash(f[1]));
-                        b[(p >> 56) as usize].push(Cl { person: p, cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
+                        v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
                     });
+                    let mut b: Vec<Vec<Cl>> = bucket(v.len());
+                    for i in 0..v.len() {
+                        if let Some(n) = v.get(i + PF) {
+                            pmap.prefetch(n.person);
+                        }
+                        let mut c = v[i];
+                        c.person = person(c.person);
+                        b[(c.person >> 56) as usize].push(c);
+                    }
                     b
                 })
                 .collect::<Vec<_>>()
@@ -606,7 +675,14 @@ fn main() {
                         }
                     }
                     let mut b: Vec<Vec<Ev2>> = bucket(best.len());
-                    for e in best.iter().filter(|e| e.ts != BAD) {
+                    for i in 0..best.len() {
+                        if let Some(n) = best.get(i + PF) {
+                            pmap.prefetch(n.user);
+                        }
+                        let e = &best[i];
+                        if e.ts == BAD {
+                            continue;
+                        }
                         let q = person(e.user);
                         b[(q >> 56) as usize].push(Ev2 { person: q, loc: e.loc, ts: e.ts, price: e.price, cat: e.cat });
                     }
