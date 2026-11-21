@@ -1324,6 +1324,12 @@ fn main() {
                         st.rows.push(r);
                     }
     };
+    // click partition: by key hash, but with an event key a fast person's clicks go by person number,
+    // so the clean jobs, which walk persons in that order, look clicks up in a few partitions at a time
+    let cq = |k: u64| -> usize {
+        let p = unmix(k) >> 9;
+        if cx.ek.is_some() && p < cx.nb { (p * P as u64 / cx.nb) as usize } else { (k >> (64 - PB)) as usize }
+    };
     // 2: clicks by person; events deduped, then by person
     let (fc, fd) = (
         || {
@@ -1344,13 +1350,13 @@ fn main() {
                     });
                     let mut cnt = vec![0u32; P];
                     for c in &v {
-                        cnt[(c.person >> (64 - PB)) as usize] += 1;
+                        cnt[cq(c.person)] += 1;
                     }
                     // exact sizes: whale persons would overflow fixed buckets into growing Vecs
                     let mut b = Bk::exact(&cnt);
                     let mut w = Wc::new();
                     for c in &v {
-                        w.push(&mut b, (c.person >> (64 - PB)) as usize, *c);
+                        w.push(&mut b, cq(c.person), *c);
                     }
                     w.finish(&mut b);
                     b
@@ -1550,35 +1556,16 @@ fn main() {
         });
         lap("clicks parsed, events deduped by index");
         drop(s1);
-        // clicks whose key is a fast person's, by person number: a job walks persons in that order, so
-        // lookups stay local; the rest by key in hash partitions
-        let vb = cx.nb << 9;
-        let mut fk: Vec<(u64, Cl)> = cl.par_iter().flat_map_iter(|c| (0..P).flat_map(move |q| c.get(q)).flatten().map(|x| (unmix(x.person), *x)).filter(|x| x.0 < vb)).collect();
-        lap("fast clicks collected");
-        fk.par_sort_unstable_by_key(|x| (x.0, x.1.ts));
-        lap("fast clicks sorted");
-        let fvs: Vec<u64> = fk.par_iter().map(|x| x.0).collect();
-        let fcs: Vec<Cl> = fk.par_iter().map(|x| x.1).collect();
-        drop(fk);
-        lap("fast clicks split");
         let cs: Vec<Vec<Cl>> = (0..P)
             .into_par_iter()
             .map(|q| {
-                let mut v: Vec<Cl> = cl.iter().flat_map(|c| c.get(q)).flatten().filter(|x| unmix(x.person) >= vb).copied().collect();
-                v.sort_unstable_by_key(|c| (c.person, c.ts));
+                let mut v = vec![];
+                group(&cl, q, |c| (c.person, c.ts), &mut v);
                 v
             })
             .collect();
-        let fclk = |v: u64| -> &[Cl] {
-            let a = fvs.partition_point(|&x| x < v);
-            &fcs[a..a + fvs[a..].partition_point(|&x| x == v)]
-        };
         let clk = |key: u64| -> &[Cl] {
-            let v = unmix(key);
-            if v < vb {
-                return fclk(v);
-            }
-            let c = &cs[(key >> (64 - PB)) as usize];
+            let c = &cs[cq(key)];
             let a = c.partition_point(|x| x.person < key);
             &c[a..a + c[a..].partition_point(|x| x.person == key)]
         };
@@ -1593,7 +1580,7 @@ fn main() {
         }
         // clean runs, 32 jobs over the index partitions; a run crossing edges belongs to the partition it starts in
         // jobs split by estimated cost: low indices hold heavy persons, high ones many light persons
-        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len() + 64 * x.2; Some(*a) })).collect();
+        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len() + 16 * x.2; Some(*a) })).collect();
         let jb: Vec<usize> = (0..=32).map(|k| if k == 32 { P - 1 } else { cum.partition_point(|&c| c * 32 < k * cum[P - 1]) }).collect();
         let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
             .into_par_iter()
@@ -1649,7 +1636,7 @@ fn main() {
                                 b += 1;
                             }
                             let name = fname(v, &mut st.nbuf);
-                            body(&mut st, &r[a..b], fclk(v), name);
+                            body(&mut st, &r[a..b], clk(mix(v)), name);
                             a = b;
                         }
                     }
