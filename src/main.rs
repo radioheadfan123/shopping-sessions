@@ -538,7 +538,7 @@ struct Bk<T> {
 }
 impl<T: Copy> Bk<T> {
     fn new(n: usize) -> Self {
-        let cap = n / P + n / P / 4 + 16;
+        let cap = n / P + n / P / 8 + 16; // ~2.5 sd over the mean at 8 MB chunks; the rare full partition spills
         Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
     }
     #[inline(always)]
