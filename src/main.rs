@@ -150,6 +150,8 @@ impl Tab {
     }
 }
 const PF: usize = 16; // prefetch distance in rows
+const MF: usize = 64; // person map prefetch distance: DRAM misses, the loop is short
+const SF: usize = 64; // s1 stream prefetch distance (2 KB of 32 B rows)
 
 thread_local! {
     static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
@@ -1075,9 +1077,13 @@ fn main() {
                     best.reserve(n);
                     bc.clear();
                     let mut ahead = s1.iter().flat_map(|c| c.get(p)).flatten().skip(PF);
+                    let mut far = s1.iter().flat_map(|c| c.get(p)).flatten().skip(SF); // s1 rows come from DRAM: pull lines in early
                     for (ci, e) in s1.iter().enumerate().flat_map(|(ci, c)| c.get(p).into_iter().flatten().map(move |e| (ci as u16, e))) {
+                        use std::arch::x86_64::*;
+                        if let Some(a) = far.next() {
+                            unsafe { _mm_prefetch(a as *const Ev as *const i8, _MM_HINT_T0) }
+                        }
                         if let Some(a) = ahead.next() {
-                            use std::arch::x86_64::*;
                             unsafe { _mm_prefetch(tab.as_ptr().add(a.eid as usize & (cap - 1)) as *const i8, _MM_HINT_T0) }
                         }
                         let (tag, mut h) = (((e.eid >> (64 - PB - 32)) as u32) & !rmask, e.eid as usize & (cap - 1));
@@ -1101,16 +1107,16 @@ fn main() {
                         }
                     }
                     let user = |e: &Ev| e.uh;
-                    let mut ring = [0u64; PF]; // user hashes of the next PF rows, already prefetched
+                    let mut ring = [0u64; MF]; // user hashes of the next MF rows, already prefetched
                     for (r, e) in ring.iter_mut().zip(best.iter()) {
                         *r = user(e);
                         pmap.prefetch(*r);
                     }
                     for i in 0..best.len() {
-                        let u = ring[i % PF];
-                        if let Some(n) = best.get(i + PF) {
-                            ring[i % PF] = user(n);
-                            pmap.prefetch(ring[i % PF]);
+                        let u = ring[i % MF];
+                        if let Some(n) = best.get(i + MF) {
+                            ring[i % MF] = user(n);
+                            pmap.prefetch(ring[i % MF]);
                         }
                         let e = &best[i];
                         if e.ts == BAD {
