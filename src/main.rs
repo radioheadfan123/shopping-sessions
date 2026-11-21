@@ -1343,6 +1343,10 @@ fn main() {
         }
     }
     lap("written");
+    if std::env::var("PROF").is_ok() {
+        let st = std::fs::read_to_string("/proc/self/status").unwrap();
+        eprintln!("{}", st.lines().filter(|l| l.starts_with("Rss") || l.starts_with("VmHWM")).collect::<Vec<_>>().join(" | "));
+    }
     if kn("EXIT", 0) == 1 {
         unsafe { libc::_exit(0) } // files are closed; skip freeing what the kernel frees anyway
     }
