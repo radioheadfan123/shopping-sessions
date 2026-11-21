@@ -7,6 +7,44 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
+/// Big blocks (>= 2 MB) come straight from mmap, 2 MB aligned and marked for huge pages, then
+/// pre-faulted in one call: fresh 4 KB page faults were about a fifth of the run time.
+struct Big;
+const BIG: usize = 2 << 20;
+unsafe impl std::alloc::GlobalAlloc for Big {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() < BIG || l.align() > BIG {
+            return unsafe { std::alloc::System.alloc(l) };
+        }
+        let n = l.size().next_multiple_of(BIG);
+        unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), n + BIG, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            if p == libc::MAP_FAILED {
+                return std::ptr::null_mut();
+            }
+            let a = (p as usize).next_multiple_of(BIG);
+            if a > p as usize {
+                libc::munmap(p, a - p as usize);
+            }
+            if a + n < p as usize + n + BIG {
+                libc::munmap((a + n) as *mut libc::c_void, p as usize + BIG - a);
+            }
+            libc::madvise(a as *mut libc::c_void, n, libc::MADV_HUGEPAGE);
+            libc::madvise(a as *mut libc::c_void, n, 23); // MADV_POPULATE_WRITE (Linux 5.14+); a no-op error before that
+            a as *mut u8
+        }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() < BIG || l.align() > BIG {
+            unsafe { std::alloc::System.dealloc(p, l) }
+        } else {
+            unsafe { libc::munmap(p as *mut libc::c_void, l.size().next_multiple_of(BIG)) };
+        }
+    }
+}
+#[global_allocator]
+static GA: Big = Big;
+
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
@@ -133,7 +171,7 @@ fn map(path: &Path) -> &'static [u8] {
         return &[];
     }
     unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
+        let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_POPULATE, f.as_raw_fd(), 0);
         assert!(p != libc::MAP_FAILED, "mmap {path:?}");
         std::slice::from_raw_parts(p as *const u8, n)
     }
@@ -207,75 +245,93 @@ fn split(line: &'static [u8], out: &mut [&'static [u8]]) -> bool {
     }
 }
 
-/// Bitmasks of separators (',' or '\n') and of '"' over 64 bytes.
+/// Bitmasks of ',' , '\n' and '"' over 64 bytes.
 #[inline(always)]
-fn masks(b: &[u8; 64]) -> (u64, u64) {
+fn masks(b: &[u8; 64]) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     unsafe {
         let (c, n, q) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
-        let (mut s, mut m) = (0u64, 0u64);
+        let (mut cm, mut nm, mut qm) = (0u64, 0u64, 0u64);
         for i in 0..4 {
             let v = _mm_loadu_si128(b.as_ptr().add(16 * i) as *const __m128i);
-            s |= (_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v, c), _mm_cmpeq_epi8(v, n))) as u32 as u64) << (16 * i);
-            m |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u32 as u64) << (16 * i);
+            cm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, c)) as u32 as u64) << (16 * i);
+            nm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, n)) as u32 as u64) << (16 * i);
+            qm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u32 as u64) << (16 * i);
         }
-        (s, m)
+        (cm, nm, qm)
     }
 }
 
 /// Calls f with the unquoted fields of every well-formed line of d (exactly N fields, quotes only
 /// around a whole field); skips the first line if header. Same result as lines() + split().
+/// Stage 1 lists every ',' / '\n' of a 16 KB window with the quote count before it, branch-free;
+/// stage 2 walks that list a whole line at a time.
 #[inline(always)]
 fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
-    let mut fl: [&'static [u8]; N] = [&[]; N];
-    let (mut k, mut bad, mut skip, mut fs, mut qs, mut qtot) = (0usize, false, header, 0usize, 0u32, 0u32);
-    let mut sep = |pos: usize, qb: u32, nl: bool, k: &mut usize, bad: &mut bool| {
-        let nq = qb - qs;
-        qs = qb;
-        let x = &d[fs..pos];
-        if *k < N {
-            fl[*k] = if nq == 0 {
-                x
-            } else if nq == 2 && x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"' {
-                &x[1..x.len() - 1]
-            } else {
-                *bad = true;
-                x
-            };
-        }
-        *k += 1;
-        if nl {
-            if skip {
-                skip = false;
-            } else if !*bad && *k == N {
-                f(&fl);
-            }
-            *k = 0;
-            *bad = false;
-        }
-        fs = pos + 1;
-    };
-    let mut base = 0;
+    const W: usize = 16 << 10;
+    assert!(d.len() < u32::MAX as usize - 128);
+    let mut e: Vec<(u32, u32)> = Vec::with_capacity(W + 128); // (offset, quotes before it)
+    let (mut qtot, mut skip, mut base, mut ls, mut lq) = (0u32, header, 0usize, 0usize, 0u32);
+    let nl = |p: u32| d.get(p as usize).is_none_or(|&c| c == b'\n'); // past the end = the last line's break
     while base < d.len() {
-        let mut tmp = [0u8; 64];
-        let blk: &[u8; 64] = if d.len() - base >= 64 {
-            d[base..base + 64].try_into().unwrap()
-        } else {
-            tmp[..d.len() - base].copy_from_slice(&d[base..]);
-            &tmp
-        };
-        let (mut s, m) = masks(blk);
-        while s != 0 {
-            let o = s.trailing_zeros();
-            s &= s - 1;
-            let qb = qtot + (m & ((1u64 << o) - 1)).count_ones();
-            sep(base + o as usize, qb, blk[o as usize] == b'\n', &mut k, &mut bad);
+        let stop = (base + W).min(d.len());
+        e.reserve(stop - base + 128);
+        let (ep, mut n) = (e.as_mut_ptr(), e.len());
+        while base < stop {
+            let mut tmp = [0u8; 64];
+            let blk: &[u8; 64] = if d.len() - base >= 64 {
+                d[base..base + 64].try_into().unwrap()
+            } else {
+                tmp[..d.len() - base].copy_from_slice(&d[base..]);
+                tmp[d.len() - base] = b'\n'; // harmless if the data already ends with one
+                &tmp
+            };
+            let (cm, nm, qm) = masks(blk);
+            let mut b = cm | nm;
+            let cnt = b.count_ones() as usize;
+            let mut u = 0;
+            loop {
+                for _ in 0..8 {
+                    let below = b.wrapping_sub(1) & !b;
+                    unsafe { ep.add(n + u).write(((base as u32).wrapping_add(b.trailing_zeros()), qtot + (qm & below).count_ones())) };
+                    b &= b.wrapping_sub(1);
+                    u += 1;
+                }
+                if u >= cnt {
+                    break;
+                }
+            }
+            n += cnt;
+            qtot += qm.count_ones();
+            base += 64;
         }
-        qtot += m.count_ones();
-        base += 64;
-    }
-    if d.last().is_some_and(|&c| c != b'\n') {
-        sep(d.len(), qtot, true, &mut k, &mut bad);
+        if base == d.len() && d[d.len() - 1] != b'\n' {
+            unsafe { ep.add(n).write((d.len() as u32, qtot)) }; // no break after the last line, and no tail block to add one
+            n += 1;
+        }
+        unsafe { e.set_len(n) };
+        let mut k = 0;
+        while k < e.len() {
+            let Some(j) = e[k..].iter().position(|x| nl(x.0)) else { break }; // line goes on in the next window
+            if j == N - 1 && !skip {
+                let mut fl: [&'static [u8]; N] = [&[]; N];
+                let (mut s, mut q0, mut good) = (ls, lq, true);
+                for (j, &(p, q)) in e[k..k + N].iter().enumerate() {
+                    let x = unsafe { d.get_unchecked(s..(p as usize).min(d.len())) };
+                    let w = q - q0 == 2 && x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"';
+                    good &= q == q0 || w;
+                    fl[j] = if w { &x[1..x.len() - 1] } else { x };
+                    (s, q0) = (p as usize + 1, q);
+                }
+                if good {
+                    f(&fl);
+                }
+            }
+            skip = false;
+            (ls, lq) = (e[k + j].0 as usize + 1, e[k + j].1);
+            k += j + 1;
+        }
+        e.drain(..k);
     }
 }
 
@@ -439,15 +495,41 @@ fn window(json: &str, key: &str) -> i64 {
     parse_ts(r[..r.find('"').unwrap()].as_bytes()).expect("manifest ts")
 }
 
-/// P empty partitions with room for about n rows in total.
-fn bucket<T>(n: usize) -> Vec<Vec<T>> {
-    (0..P).map(|_| Vec::with_capacity(n / P + n / P / 4 + 16)).collect()
+/// P partitions of about n rows in total, in one block so the allocator can hand it out as huge,
+/// pre-faulted pages; a full partition spills into its own Vec.
+struct Bk<T> {
+    v: Vec<T>,
+    n: Vec<u32>,
+    cap: usize,
+    spill: Vec<Vec<T>>,
+}
+impl<T: Copy> Bk<T> {
+    fn new(n: usize) -> Self {
+        let cap = n / P + n / P / 4 + 16;
+        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        let k = self.n[b] as usize;
+        if k < self.cap {
+            unsafe { self.v.as_mut_ptr().add(b * self.cap + k).write(x) };
+            self.n[b] += 1;
+        } else {
+            self.spill[b].push(x);
+        }
+    }
+    fn get(&self, b: usize) -> [&[T]; 2] {
+        [unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(b * self.cap), self.n[b] as usize) }, &self.spill[b]]
+    }
+    fn len(&self, b: usize) -> usize {
+        self.n[b] as usize + self.spill[b].len()
+    }
 }
 
 #[inline(always)]
-fn parse_event(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut [Vec<Ev>]) {
+fn parse_event(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut Bk<Ev>) {
     if let Some(e) = event(f, cx) {
-        out[(e.eid >> 56) as usize].push(e);
+        out.push((e.eid >> 56) as usize, e);
     }
 }
 
@@ -541,7 +623,7 @@ fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
 
 fn main() {
     let t0 = std::time::Instant::now();
-    let lap = |what: &str| if std::env::var("PROF").is_ok() { eprintln!("{:>7.1} ms {what}", t0.elapsed().as_secs_f64() * 1e3) };
+    let lap = |what: &str| if std::env::var("PROF").is_ok() { { let mut r: libc::rusage = unsafe { std::mem::zeroed() }; unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }; eprintln!("{:>7.1} ms {what} flt {}", t0.elapsed().as_secs_f64() * 1e3, r.ru_minflt) } };
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let data = std::path::PathBuf::from(env("DATA_DIR", "/data"));
     let out = std::path::PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -604,7 +686,7 @@ fn main() {
             chunks(&csvs(&data.join("events")))
                 .par_iter()
                 .map(|&(d, h)| {
-                    let mut b: Vec<Vec<Ev>> = bucket(d.len() / 70);
+                    let mut b = Bk::new(d.len() / 70);
                     scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
                     b
                 })
@@ -632,14 +714,14 @@ fn main() {
                         let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
                         v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
                     });
-                    let mut b: Vec<Vec<Cl>> = bucket(v.len());
+                    let mut b = Bk::new(v.len());
                     for i in 0..v.len() {
                         if let Some(n) = v.get(i + PF) {
                             pmap.prefetch(n.person);
                         }
                         let mut c = v[i];
                         c.person = person(c.person);
-                        b[(c.person >> 56) as usize].push(c);
+                        b.push((c.person >> 56) as usize, c);
                     }
                     b
                 })
@@ -649,12 +731,12 @@ fn main() {
             (0..P)
                 .into_par_iter()
                 .map(|p| {
-                    let n: usize = s1.iter().map(|c| c[p].len()).sum();
+                    let n: usize = s1.iter().map(|c| c.len(p)).sum();
                     let cap = (n * 2).next_power_of_two().max(16);
                     let (mut keys, mut slot) = (vec![0u64; cap], vec![u32::MAX; cap]);
                     let mut best: Vec<Ev> = Vec::with_capacity(n);
-                    for c in &s1 {
-                        for e in &c[p] {
+                    for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
+                        {
                             let mut h = e.eid as usize & (cap - 1);
                             loop {
                                 if slot[h] == u32::MAX {
@@ -674,7 +756,7 @@ fn main() {
                             }
                         }
                     }
-                    let mut b: Vec<Vec<Ev2>> = bucket(best.len());
+                    let mut b = Bk::new(best.len());
                     for i in 0..best.len() {
                         if let Some(n) = best.get(i + PF) {
                             pmap.prefetch(n.user);
@@ -684,7 +766,7 @@ fn main() {
                             continue;
                         }
                         let q = person(e.user);
-                        b[(q >> 56) as usize].push(Ev2 { person: q, loc: e.loc, ts: e.ts, price: e.price, cat: e.cat });
+                        b.push((q >> 56) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, price: e.price, cat: e.cat });
                     }
                     b
                 })
@@ -710,10 +792,8 @@ fn main() {
         .fold(
             || St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0 },
             |mut st, q| {
-                let mut ev: Vec<Ev2> = s2.iter().flat_map(|c| c[q].iter().copied()).collect();
-                ev.sort_unstable_by_key(|e| (e.person, e.ts));
-                let mut ck: Vec<Cl> = cl.iter().flat_map(|c| c[q].iter().copied()).collect();
-                ck.sort_unstable_by_key(|c| (c.person, c.ts));
+                let ev = group(&s2, q, |e| (e.person, e.ts));
+                let ck = group(&cl, q, |c| (c.person, c.ts));
                 let (mut i, mut ci) = (0, 0);
                 while i < ev.len() {
                     let pk = ev[i].person;
@@ -840,6 +920,35 @@ fn main() {
         },
     );
     lap("written");
+}
+
+/// Partition q of every chunk, ordered by key: one counting pass on the person bits under the
+/// partition byte (about 8 rows per bucket), then a small sort per bucket.
+fn group<T: Copy>(src: &[Bk<T>], q: usize, key: impl Fn(&T) -> (u64, u32)) -> Vec<T> {
+    let n: usize = src.iter().map(|c| c.len(q)).sum();
+    let bits = (usize::BITS - (n / 8).leading_zeros()).clamp(1, 16);
+    let b = |x: &T| (key(x).0 >> (56 - bits)) as usize & ((1 << bits) - 1);
+    let mut at = vec![0u32; (1 << bits) + 1];
+    for x in src.iter().flat_map(|c| c.get(q)).flatten() {
+        at[b(x) + 1] += 1;
+    }
+    for i in 1..at.len() {
+        at[i] += at[i - 1];
+    }
+    let mut out = Vec::with_capacity(n);
+    let o = out.spare_capacity_mut();
+    for x in src.iter().flat_map(|c| c.get(q)).flatten() {
+        let k = b(x);
+        o[at[k] as usize].write(*x);
+        at[k] += 1;
+    }
+    unsafe { out.set_len(n) };
+    let mut s = 0;
+    for &e in &at[..1 << bits] {
+        out[s..e as usize].sort_unstable_by_key(&key);
+        s = e as usize;
+    }
+    out
 }
 
 /// Category with the highest purchase sum, ties to the smallest name (indices are in name order); clears the list.
