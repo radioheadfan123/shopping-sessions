@@ -150,6 +150,7 @@ impl Tab {
 const PF: usize = 16; // prefetch distance in rows
 
 thread_local! {
+    static MODE: u32 = std::env::var("MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
     static SCRATCH: std::cell::RefCell<(Vec<u64>, Vec<Ev>)> = Default::default();
@@ -850,11 +851,15 @@ fn main() {
                     WC.with_borrow_mut(|w| {
                         let w = w.get_or_insert_with(Wc::new);
                         w.t.fill(0);
-                        scan::<7>(d, h, |f| {
-                            if let Some(e) = event(f, &cx) {
-                                w.push(&mut b, (e.eid >> (64 - PB)) as usize, e);
-                            }
-                        });
+                        match MODE.with(|m| *m) {
+                            1 => { let mut c = 0u64; scan::<7>(d, h, |f| c += f[0].len() as u64); std::hint::black_box(c); }
+                            2 => { let mut c = 0u64; scan::<7>(d, h, |f| if let Some(e) = event(f, &cx) { c ^= e.eid ^ e.uh ^ e.ts as u64; }); std::hint::black_box(c); }
+                            _ => scan::<7>(d, h, |f| {
+                                if let Some(e) = event(f, &cx) {
+                                    w.push(&mut b, (e.eid >> (64 - PB)) as usize, e);
+                                }
+                            }),
+                        }
                         w.finish(&mut b);
                     });
                     b
@@ -863,6 +868,7 @@ fn main() {
         },
     );
     lap("links + events parsed");
+    if MODE.with(|m| *m) != 0 { return; }
     let person = |u: u64| pmap.get(u).unwrap_or(u);
 
     // 2: clicks by person; events deduped, then by person
