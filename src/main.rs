@@ -120,13 +120,6 @@ impl Tab {
     fn slot(&self, k: u64) -> usize {
         k.max(1) as usize & self.mask
     }
-    fn insert(&mut self, k: u64, v: u64) {
-        let (k, mut i) = (k.max(1), self.slot(k));
-        while self.s[i].0 != 0 && self.s[i].0 != k {
-            i = (i + 1) & self.mask;
-        }
-        self.s[i] = (k, v);
-    }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u64> {
         let (k, mut i) = (k.max(1), self.slot(k));
@@ -684,59 +677,74 @@ fn pairs(files: &[&'static [u8]]) -> Vec<[(u64, u64); 2]> {
         .collect()
 }
 
-// sequential union-find: runs beside event parsing, so it is off the critical path
+// Lock-free union-find (link the higher slot under the lower by CAS, halve paths by CAS); an id's
+// node is its slot in idx, so ids are numbered by the same concurrent insert that dedups them.
 fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
     let t = std::time::Instant::now();
     let pr = |w: &str| if std::env::var("PROF").is_ok() { eprintln!("  persons {w} {:.1} ms", t.elapsed().as_secs_f64() * 1e3) };
-    let mut idx = Tab::new(pairs.len() * 2); // id hash -> index
-    let (mut parent, mut ids): (Vec<u32>, Vec<(u64, u64)>) = (vec![], vec![]);
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        while p[x as usize] != x {
-            p[x as usize] = p[p[x as usize] as usize];
-            x = p[x as usize];
-        }
-        x
-    }
-    for (i, pr) in pairs.iter().enumerate() {
-        if let Some(n) = pairs.get(i + PF) {
-            idx.prefetch(n[0].1);
-            idx.prefetch(n[1].1);
-        }
-        let mut id = |(l, h): (u64, u64)| match idx.get(h) {
-            Some(i) => i as u32,
-            None => {
-                let i = ids.len() as u32;
-                idx.insert(h, i as u64);
-                parent.push(i);
-                ids.push((l, h));
-                i
+    let mut idx = Tab::new(pairs.len() * 2); // id hash -> name loc, then -> person key
+    let (cap, mask) = (idx.s.len(), idx.mask);
+    assert!(cap < u32::MAX as usize);
+    let sp = idx.s.as_mut_ptr() as usize;
+    let key = |i: usize| unsafe { &*(std::ptr::addr_of_mut!((*(sp as *mut (u64, u64)).add(i)).0) as *const AtomicU64) };
+    let val = |i: usize| unsafe { &*(std::ptr::addr_of_mut!((*(sp as *mut (u64, u64)).add(i)).1) as *const AtomicU64) };
+    let parent: Vec<AtomicU32> = (0..cap as u32).into_par_iter().map(AtomicU32::new).collect();
+    let ins = |(l, h): (u64, u64)| {
+        let k = h.max(1);
+        let mut i = k as usize & mask;
+        loop {
+            let a = key(i).load(Relaxed);
+            if a == k {
+                return i as u32;
             }
-        };
-        let (a, b) = (id(pr[0]), id(pr[1]));
-        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-        if ra != rb {
-            parent[ra.max(rb) as usize] = ra.min(rb);
+            if a == 0 {
+                match key(i).compare_exchange(0, k, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        val(i).store(l, Relaxed);
+                        return i as u32;
+                    }
+                    Err(x) if x == k => return i as u32,
+                    Err(_) => continue, // another id took the slot: look at it again
+                }
+            }
+            i = (i + 1) & mask;
         }
-    }
+    };
+    let find = |mut x: u32| loop {
+        let p = parent[x as usize].load(Relaxed);
+        if p == x {
+            return x;
+        }
+        let g = parent[p as usize].load(Relaxed);
+        if g != p {
+            let _ = parent[x as usize].compare_exchange(p, g, Relaxed, Relaxed);
+        }
+        x = g;
+    };
+    pairs.par_iter().with_min_len(4096).for_each(|pr| {
+        let (mut a, mut b) = (ins(pr[0]), ins(pr[1]));
+        loop {
+            (a, b) = (find(a), find(b));
+            if a == b || parent[a.max(b) as usize].compare_exchange(a.max(b), a.min(b), Relaxed, Relaxed).is_ok() {
+                break;
+            }
+        }
+    });
+    drop(pairs);
     pr("union");
-    // the rest runs in parallel beside the event parse: read-only finds (union halved the paths),
-    // smallest name per set by CAS, then idx's values rewritten in place from index to person key
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    let n = ids.len();
-    let root: Vec<u32> = (0..n as u32)
-        .into_par_iter()
-        .map(|mut x| {
-            while parent[x as usize] != x {
-                x = parent[x as usize];
-            }
-            x
-        })
-        .collect();
-    let best: Vec<AtomicU32> = (0..n as u32).into_par_iter().map(AtomicU32::new).collect();
-    (0..n).into_par_iter().for_each(|x| {
-        let b = &best[root[x] as usize];
+    // root of every used slot, then the id with the smallest name per set (CAS min)
+    let root: Vec<u32> = (0..cap as u32).into_par_iter().map(|i| if key(i as usize).load(Relaxed) == 0 { u32::MAX } else { find(i) }).collect();
+    let best = parent; // reused: best[r] = slot of the smallest name in r's set
+    best.par_iter().enumerate().for_each(|(i, b)| b.store(i as u32, Relaxed));
+    (0..cap).into_par_iter().for_each(|x| {
+        let r = root[x];
+        if r == u32::MAX || r as usize == x {
+            return;
+        }
+        let b = &best[r as usize];
         let mut cur = b.load(Relaxed);
-        while at(ids[x].0) < at(ids[cur as usize].0) {
+        while at(val(x).load(Relaxed)) < at(val(cur as usize).load(Relaxed)) {
             match b.compare_exchange_weak(cur, x as u32, Relaxed, Relaxed) {
                 Ok(_) => break,
                 Err(c) => cur = c,
@@ -744,27 +752,20 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
         }
     });
     pr("best");
-    let (sp, mask) = (idx.s.as_mut_ptr() as usize, idx.mask);
-    (0..n).into_par_iter().for_each(|x| {
-        let key = ids[best[root[x] as usize].load(Relaxed) as usize].1;
-        let k = ids[x].1.max(1);
-        let s = sp as *mut (u64, u64);
-        let mut i = k as usize & mask;
-        unsafe {
-            while (*s.add(i)).0 != k {
-                i = (i + 1) & mask;
-            }
-            (*s.add(i)).1 = key; // each id owns its slot: disjoint writes
-        }
-    });
-    let names: Map<u64> = (0..n)
+    let names: Map<u64> = (0..cap)
         .into_par_iter()
         .filter(|&x| root[x] as usize == x)
         .map(|x| {
-            let (name, key) = ids[best[x].load(Relaxed) as usize];
-            (key, name)
+            let b = best[x].load(Relaxed) as usize;
+            (key(b).load(Relaxed), val(b).load(Relaxed))
         })
         .collect();
+    // names are read: now every id's value becomes its person key (the smallest name's id hash)
+    (0..cap).into_par_iter().for_each(|x| {
+        if root[x] != u32::MAX {
+            val(x).store(key(best[root[x] as usize].load(Relaxed) as usize).load(Relaxed), Relaxed);
+        }
+    });
     pr("maps");
     (idx, names)
 }
