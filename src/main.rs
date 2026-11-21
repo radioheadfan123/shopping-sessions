@@ -220,6 +220,7 @@ fn map(path: &Path) -> &'static [u8] {
         let pop = if std::env::var("POP").is_ok() { libc::MAP_POPULATE } else { 0 };
         let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE | pop, f.as_raw_fd(), 0);
         assert!(p != libc::MAP_FAILED, "mmap {path:?}");
+        libc::madvise(p, n, libc::MADV_WILLNEED); // async readahead: a cold page cache fills while earlier files parse
         std::slice::from_raw_parts(p as *const u8, n)
     }
 }
@@ -989,8 +990,9 @@ fn main() {
         lap(&format!("ONLY={m} done {tot}"));
         unsafe { libc::_exit(0) }
     }
-    let lp = pairs(&csvs(&data.join("links")));
-    let ech = chunks(&csvs(&data.join("events")));
+    let (lf, ef, cf) = (csvs(&data.join("links")), csvs(&data.join("events")), csvs(&data.join("clicks")));
+    let lp = pairs(&lf);
+    let ech = chunks(&ef);
     let ((pmap, names), s1) = rayon::join(
         || person_tab(lp),
         || {
@@ -1019,7 +1021,7 @@ fn main() {
     // 2: clicks by person; events deduped, then by person
     let (fc, fd) = (
         || {
-            chunks(&csvs(&data.join("clicks")))
+            chunks(&cf)
                 .par_iter()
                 .map(|&(d, h)| {
                     let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
