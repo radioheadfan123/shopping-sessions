@@ -1106,7 +1106,8 @@ fn main() {
             let [m, sp] = bk.get(pp);
             let r = if t < m.len() { &m[t] } else { &sp[t - m.len()] };
             // each row is killed by the one job that owns its eid: no two threads write the same row
-            unsafe { std::ptr::write_volatile(std::ptr::addr_of!(r.ts) as *mut u32, KILL) }
+            // atomic store: the row sits behind a shared reference while other jobs read their own rows
+            unsafe { (*(std::ptr::addr_of!(r.ts) as *const std::sync::atomic::AtomicU32)).store(KILL, std::sync::atomic::Ordering::Relaxed) }
         }
     };
     let fd = || {
