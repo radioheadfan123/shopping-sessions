@@ -1157,6 +1157,9 @@ fn main() {
         }
     }
     lap("written");
+    if kn("EXIT", 0) == 1 {
+        unsafe { libc::_exit(0) } // files are closed; skip freeing what the kernel frees anyway
+    }
 }
 
 /// Partition q of every chunk, ordered by key: one counting pass on the person bits under the
