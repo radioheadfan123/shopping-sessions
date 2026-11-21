@@ -587,7 +587,7 @@ fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
             v
         })
         .collect();
-    let mut idx: Map<u32> = Map::default();
+    let mut idx: Map<u32> = Map::with_capacity_and_hasher(pairs.len() * 2, Default::default());
     let (mut parent, mut locs): (Vec<u32>, Vec<u64>) = (vec![], vec![]);
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
