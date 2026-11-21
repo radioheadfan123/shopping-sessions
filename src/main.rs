@@ -17,6 +17,17 @@ unsafe impl std::alloc::GlobalAlloc for Big {
             return unsafe { std::alloc::System.alloc(l) };
         }
         let n = l.size().next_multiple_of(BIG);
+        {
+            // freed blocks are kept and handed out again: no munmap, and no kernel page zeroing on reuse
+            let mut pool = POOL.lock().unwrap();
+            if let Some(i) = (0..pool.len()).filter(|&i| pool[i].1 >= n).min_by_key(|&i| pool[i].1) {
+                let (p, m) = pool.swap_remove(i);
+                if m > n {
+                    pool.push((p + n, m - n));
+                }
+                return p as *mut u8;
+            }
+        }
         unsafe {
             let p = libc::mmap(std::ptr::null_mut(), n + BIG, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
             if p == libc::MAP_FAILED {
@@ -38,10 +49,13 @@ unsafe impl std::alloc::GlobalAlloc for Big {
         if l.size() < BIG || l.align() > BIG {
             unsafe { std::alloc::System.dealloc(p, l) }
         } else {
-            unsafe { libc::munmap(p as *mut libc::c_void, l.size().next_multiple_of(BIG)) };
+            POOL.lock().unwrap().push((p as usize, l.size().next_multiple_of(BIG)));
         }
     }
 }
+/// Freed big blocks (address, bytes). ponytail: no coalescing of neighbours; add it if a big
+/// request ever misses a pool that holds enough adjacent bytes.
+static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 #[global_allocator]
 static GA: Big = Big;
 
@@ -649,6 +663,11 @@ fn main() {
     let data = std::path::PathBuf::from(env("DATA_DIR", "/data"));
     let out = std::path::PathBuf::from(env("OUTPUT_DIR", "/output"));
     let ncpu = env("NCPU", "0").parse().unwrap_or(0);
+    // blocks under BIG stay in malloc's heaps when freed (reused without fresh zeroed pages)
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, BIG as i32);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, i32::MAX);
+    }
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
 
     let man = std::fs::read_to_string(data.join("manifest.json")).unwrap();
