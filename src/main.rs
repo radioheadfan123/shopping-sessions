@@ -1283,8 +1283,12 @@ fn main() {
             }
     };
     // 32 jobs of P / 32 partitions; each writes its user_daily part as soon as it is done
-    let states: Vec<Vec<[i64; 4]>> = (0..32)
+    // heaviest jobs first: a whale person (1-2% of all events) makes its job the long pole if it starts last
+    let mut order: Vec<usize> = (0..32).collect();
+    order.sort_by_cached_key(|&k| std::cmp::Reverse((k * P / 32..(k + 1) * P / 32).map(|q| s2.iter().map(|c| c.len(q)).sum::<usize>()).sum::<usize>()));
+    let states: Vec<Vec<[i64; 4]>> = order
         .into_par_iter()
+        .with_max_len(1)
         .map(|k| {
             let mut st = St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![] };
             for q in k * P / 32..(k + 1) * P / 32 {
