@@ -781,7 +781,7 @@ fn pairs(files: &[&'static [u8]]) -> Vec<[(u64, u64); 2]> {
 fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
     let t = std::time::Instant::now();
     let pr = |w: &str| if std::env::var("PROF").is_ok() { eprintln!("  persons {w} {:.1} ms", t.elapsed().as_secs_f64() * 1e3) };
-    let mut idx = Tab::new(pairs.len() * 2); // id hash -> index
+    let mut idx = Tab::new(pairs.len() + 8); // id hash -> index; ids <= 2*pairs < cap, about 60% full
     let (mut parent, mut ids): (Vec<u32>, Vec<(u64, u64)>) = (vec![], vec![]);
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
