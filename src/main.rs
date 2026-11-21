@@ -88,6 +88,7 @@ const PB: u32 = 10; // partition bits
 const P: usize = 1 << PB; // partitions, picked by the top PB bits of a hash
 const BAD: u32 = u32::MAX;
 const CHUNK: usize = 8 << 20;
+const _: () = assert!(std::mem::size_of::<Ev>() == 40);
 
 #[derive(Default)]
 struct IdH(u64);
@@ -149,6 +150,7 @@ impl Tab {
 const PF: usize = 16; // prefetch distance in rows
 
 thread_local! {
+    static WC: std::cell::RefCell<Option<Wc>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
     static SCRATCH: std::cell::RefCell<(Vec<u64>, Vec<Ev>)> = Default::default();
 }
@@ -495,6 +497,7 @@ fn price(s: &[u8]) -> Option<u32> {
 /// Event as parsed: ts is ms after window_start, BAD if the event fails validation.
 #[derive(Clone, Copy)]
 struct Ev {
+    // 40 B: Wc streams 8 rows as 5 whole cache lines
     eid: u64,
     loc: u64, // user_id
     uh: u64,  // hash of user_id, taken while the line is still in cache
@@ -554,7 +557,7 @@ struct Bk<T> {
 }
 impl<T: Copy> Bk<T> {
     fn new(n: usize) -> Self {
-        let cap = n / P + n / P / 4 + 16;
+        let cap = (n / P + n / P / 4 + 16).next_multiple_of(8); // 8 rows of 40 B = 5 whole lines, for streaming
         Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
     }
     #[inline(always)]
@@ -575,10 +578,55 @@ impl<T: Copy> Bk<T> {
     }
 }
 
-#[inline(always)]
-fn parse_event(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut Bk<Ev>) {
-    if let Some(e) = event(f, cx) {
-        out.push((e.eid >> (64 - PB)) as usize, e);
+/// Write-combining front for a phase 1 Bk<Ev>: 8 rows per partition staged in cache, then
+/// flushed with non-temporal stores (no read-for-ownership of the destination lines).
+struct Wc {
+    buf: Vec<[Ev; 8]>,
+    t: Vec<u32>,
+}
+impl Wc {
+    fn new() -> Self {
+        Wc { buf: vec![[Ev { eid: 0, loc: 0, uh: 0, ts: 0, ingest: 0, pc: 0 }; 8]; P], t: vec![0; P] }
+    }
+    #[inline(always)]
+    fn push(&mut self, bk: &mut Bk<Ev>, b: usize, e: Ev) {
+        let t = self.t[b] as usize;
+        self.buf[b][t & 7] = e;
+        self.t[b] += 1;
+        if t & 7 == 7 {
+            let k = t - 7;
+            if k + 8 <= bk.cap {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let d = bk.v.as_mut_ptr().add(b * bk.cap + k) as *mut __m128i;
+                    let s = self.buf[b].as_ptr() as *const __m128i;
+                    if d as usize % 64 == 0 {
+                        for i in 0..20 {
+                            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+                        }
+                    } else {
+                        std::ptr::copy_nonoverlapping(s, d, 20);
+                    }
+                }
+                bk.n[b] = (k + 8) as u32;
+            } else {
+                bk.spill[b].extend_from_slice(&self.buf[b]);
+            }
+        }
+    }
+    fn finish(&self, bk: &mut Bk<Ev>) {
+        unsafe { std::arch::x86_64::_mm_sfence() };
+        for b in 0..P {
+            let t = self.t[b] as usize;
+            let (k, r) = (t & !7, t & 7);
+            if bk.n[b] as usize == k && k + r <= bk.cap {
+                for e in &self.buf[b][..r] {
+                    bk.push(b, *e);
+                }
+            } else {
+                bk.spill[b].extend_from_slice(&self.buf[b][..r]);
+            }
+        }
     }
 }
 
@@ -766,7 +814,16 @@ fn main() {
                 .par_iter()
                 .map(|&(d, h)| {
                     let mut b = Bk::new(d.len() / 70);
-                    scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
+                    WC.with_borrow_mut(|w| {
+                        let w = w.get_or_insert_with(Wc::new);
+                        w.t.fill(0);
+                        scan::<7>(d, h, |f| {
+                            if let Some(e) = event(f, &cx) {
+                                w.push(&mut b, (e.eid >> (64 - PB)) as usize, e);
+                            }
+                        });
+                        w.finish(&mut b);
+                    });
                     b
                 })
                 .collect::<Vec<_>>()
