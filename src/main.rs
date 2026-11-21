@@ -1470,11 +1470,16 @@ fn main() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         let rc: Vec<AtomicU32> = (0..cx.nb).into_par_iter().map(|_| AtomicU32::new(0)).collect();
         let fastv = |e: &Ev| if e.uh & FAST != 0 { fkey(e.uh & !FAST).map(|r| r.1) } else { None };
+        // fast survivors go to one big buffer (huge pages, no regrowth), each partition to its own exact-size slice
+        let off: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, j| { *a += s1.iter().map(|c| c.len(j)).sum::<usize>(); Some(*a) })).collect();
+        let mut fbuf: Vec<Ev2> = Vec::with_capacity(off[P]);
+        let fb = fbuf.as_mut_ptr() as usize;
         let (cl, pa) = rayon::join(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
             let r = (0..P)
                 .into_par_iter()
                 .map(|j| {
-                    let (mut fv, mut sl, mut nr) = (vec![], vec![], 0usize); // fast survivors (index order), slow ones, runs
+                    let (mut nf, mut sl, mut nr) = (0usize, vec![], 0usize); // fast survivors (index order), slow ones, runs
+                    let fp = unsafe { (fb as *mut Ev2).add(off[j]) };
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                         best.clear();
                         bc.clear();
@@ -1518,7 +1523,8 @@ fn main() {
                                             nr += 1;
                                             rc[last as usize].fetch_add(1, Relaxed);
                                         }
-                                        fv.push(Ev2 { person: v, loc: v, ts: e.ts, pc: e.pc });
+                                        unsafe { fp.add(nf).write(Ev2 { person: v, loc: v, ts: e.ts, pc: e.pc }) };
+                                        nf += 1;
                                     }
                                     None => {
                                         let (q, l) = ekey(e, bc[t as usize] as usize);
@@ -1550,7 +1556,8 @@ fn main() {
                             }
                         }
                     });
-                    (fv, sl, nr)
+                    // partition j wrote only [off[j], off[j] + nf), and fbuf outlives pa
+                    (unsafe { std::slice::from_raw_parts(fp as *const Ev2, nf) }, sl, nr)
                 })
                 .collect::<Vec<_>>();
             lap("  (dedup done)");
@@ -1558,13 +1565,20 @@ fn main() {
         });
         lap("clicks parsed, events deduped by index");
         drop(s1);
-        let cs: Vec<Vec<Cl>> = (0..P)
+        // clicks by partition, in one big buffer: each partition fills and sorts its exact slice
+        let co: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, q| { *a += cl.iter().map(|c| c.len(q)).sum::<usize>(); Some(*a) })).collect();
+        let mut cbuf: Vec<Cl> = Vec::with_capacity(co[P]);
+        let cb = cbuf.as_mut_ptr() as usize;
+        let cs: Vec<&[Cl]> = (0..P)
             .into_par_iter()
             .map(|q| {
                 // not group(): its radix step assumes keys share their top bits, and person-number partitions do not
-                let mut v: Vec<Cl> = cl.iter().flat_map(|c| c.get(q)).flatten().copied().collect();
+                let v = unsafe { std::slice::from_raw_parts_mut((cb as *mut Cl).add(co[q]), co[q + 1] - co[q]) };
+                for (d, s) in v.iter_mut().zip(cl.iter().flat_map(|c| c.get(q)).flatten()) {
+                    *d = *s;
+                }
                 v.sort_unstable_by_key(|c| (c.person, c.ts));
-                v
+                &*v
             })
             .collect();
         let clk = |key: u64| -> &[Cl] {
