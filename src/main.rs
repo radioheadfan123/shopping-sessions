@@ -485,7 +485,6 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct Ev2 {
     person: u64,
-    loc: u64,
     ts: u32,
     pc: u32, // as in Ev
 }
@@ -782,6 +781,7 @@ fn main() {
                 .map(|k| {
                     let ps = k * P / 32..(k + 1) * P / 32;
                     let mut b = Bk::new(ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum());
+                    let mut un: Map<u64> = Map::default(); // unlinked person -> user_id loc, the name fallback, kept out of Ev2
                     for p in ps {
                     SCRATCH.with_borrow_mut(|(tab, best)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
@@ -831,12 +831,18 @@ fn main() {
                         if e.ts == BAD {
                             continue;
                         }
-                        let q = person(u);
-                        b.push((q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
+                        let q = match pmap.get(u) {
+                            Some(q) => q,
+                            None => {
+                                un.entry(u).or_insert(e.loc);
+                                u
+                            }
+                        };
+                        b.push((q >> (64 - PB)) as usize, Ev2 { person: q, ts: e.ts, pc: e.pc });
                     }
                     });
                     }
-                    b
+                    (b, un)
                 })
                 .collect::<Vec<_>>()
         },
@@ -849,6 +855,14 @@ fn main() {
         rayon::join(fc, fd)
     };
     lap("clicks parsed, events deduped");
+    let (s2, un): (Vec<_>, Vec<_>) = s2.into_iter().unzip();
+    let mut names = names;
+    let nu: usize = un.iter().map(|m| m.len()).sum();
+    names.reserve(nu);
+    for m in un {
+        names.extend(m);
+    }
+    lap(&format!("names: {nu} unlinked"));
     drop(s1);
     lap("s1 dropped");
 
@@ -888,7 +902,7 @@ fn main() {
                         ci += 1;
                     }
                     let pc = &ck[c0..ci];
-                    let name = *names.get(&pk).unwrap_or(&ev[i].loc);
+                    let name = names[&pk];
                     let (mut lo, mut hi) = (0, 0);
                     let mut row: Option<URow> = None;
                     let mut cats: Vec<(u32, i64)> = vec![];
