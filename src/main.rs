@@ -383,11 +383,19 @@ fn epoch(s: &[u8]) -> Option<i64> {
 
 #[inline]
 fn iso(s: &[u8]) -> Option<i64> {
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    // bytes 0..16 XOR the template: digit lanes must come out 0..9 and separator lanes 0, so
+    // adding 0x76 (digit) or 0x7f (separator) to the low 7 bits sets a lane's top bit when it is bad
+    const H: u64 = 0x8080_8080_8080_8080;
+    const DA: u64 = u64::from_le_bytes([0x76, 0x76, 0x76, 0x76, 0x7f, 0x76, 0x76, 0x7f]);
+    const DB: u64 = u64::from_le_bytes([0x76, 0x76, 0x7f, 0x76, 0x76, 0x7f, 0x76, 0x76]);
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap()) ^ u64::from_le_bytes(*b"0000-00-");
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap()) ^ u64::from_le_bytes(*b"00T00:00");
+    if (((a & !H) + DA) | a | ((b & !H) + DB) | b) & H != 0 || s[16] != b':' {
         return None;
     }
-    let (y, mo, d) = (d2(s, 0)? * 100 + d2(s, 2)?, d2(s, 5)?, d2(s, 8)?);
-    let (h, mi, se) = (d2(s, 11)?, d2(s, 14)?, d2(s, 17)?);
+    let g = |x: u64, i: usize| (x >> (8 * i)) as u8 as i64;
+    let (y, mo, d) = (g(a, 0) * 1000 + g(a, 1) * 100 + g(a, 2) * 10 + g(a, 3), g(a, 5) * 10 + g(a, 6), g(b, 0) * 10 + g(b, 1));
+    let (h, mi, se) = (g(b, 3) * 10 + g(b, 4), g(b, 6) * 10 + g(b, 7), d2(s, 17)?);
     if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
@@ -673,7 +681,7 @@ fn main() {
                 }
             }
         }
-        for (t, w) in [("0001", Some(1)), ("9223372036854775807", Some(i64::MAX)), ("9223372036854775808", None), ("00000000000000000000001", Some(1)), ("12a", None), ("", None), ("2027-12-19T18:13:05+05:30", Some(1829239985000 - 19800000)), ("2027-12-19T18:13:05-24:00", None)] {
+        for (t, w) in [("0001", Some(1)), ("9223372036854775807", Some(i64::MAX)), ("9223372036854775808", None), ("00000000000000000000001", Some(1)), ("12a", None), ("", None), ("2027-12-19T18:13:05+05:30", Some(1829239985000 - 19800000)), ("2027-12-19T18:13:05-24:00", None), ("2027-12-19X18:13:05Z", None), ("2027-1:-19T18:13:05Z", None), ("2027-12-19T18:13-05Z", None), ("2027-12-19T18:1\u{e9}5Z", None), ("2027/12-19T18:13:05Z", None), ("2027-12-19T18:13:5aZ", None)] {
             assert_eq!(parse_ts(t.as_bytes()), w, "{t}");
         }
         eprintln!("ts ok");
