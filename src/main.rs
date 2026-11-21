@@ -154,7 +154,8 @@ const PF: usize = 16; // prefetch distance in rows
 thread_local! {
     static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
-    static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<Ev>, Vec<u16>)> = Default::default(); // + chunk of each row
+    static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<D>)> = Default::default();
+    static WC2: std::cell::RefCell<Option<(Wc<R>, Wc<D>)>> = const { std::cell::RefCell::new(None) };
 }
 
 #[inline(always)]
@@ -595,14 +596,26 @@ fn uloc(d: &'static [u8], off: u32) -> u64 {
     loc(&d[s..s + n])
 }
 
-/// Valid, deduped event, keyed by person.
+/// Valid event, keyed by person; ts = KILL once dedup finds a better copy (sorts to the end of its person).
 #[derive(Clone, Copy, Default)]
-struct Ev2 {
+struct R {
     person: u64,
-    loc: u64,
     ts: u32,
-    pc: u32, // as in Ev
+    pc: u32,  // as in Ev
+    ci: u32,  // chunk, for the user_id
+    off: u32, // as in Ev
 }
+const KILL: u32 = u32::MAX;
+
+/// Dedup key of every event: eid with its top PB bits (implied by the dedup partition) replaced by the
+/// person partition of its R row; at = chunk << 20 | flat row index in that chunk's partition, all ones = no R row.
+#[derive(Clone, Copy, Default)]
+struct D {
+    eid: u64,
+    ingest: u32,
+    at: u32,
+}
+const LOW: u64 = (1 << (64 - PB)) - 1;
 
 #[derive(Clone, Copy, Default)]
 struct Cl {
@@ -993,89 +1006,115 @@ fn main() {
     let (lf, ef, cf) = (csvs(&data.join("links")), csvs(&data.join("events")), csvs(&data.join("clicks")));
     let lp = pairs(&lf);
     let ech = chunks(&ef);
-    let ((pmap, names), s1) = rayon::join(
-        || person_tab(lp),
-        || {
-            ech.par_iter()
-                .map(|&(d, h)| {
-                    assert!(d.len() < 1 << 24, "chunk too long for 24-bit user_id offsets");
-                    let mut b = Bk::new(d.len() / 70);
-                    WC.with_borrow_mut(|w| {
-                        let w = w.get_or_insert_with(Wc::new);
-                        w.t.fill(0);
-                        scan::<7>(d, h, |f| {
-                            if let Some(e) = event(f, &cx, d.as_ptr()) {
-                                w.push(&mut b, (e.eid >> (64 - PB)) as usize, e);
-                            }
-                        });
-                        w.finish(&mut b);
-                    });
-                    b
-                })
-                .collect::<Vec<_>>()
-        },
-    );
-    lap("links + events parsed");
+    // 1: person table, then events parsed once: an R row by person and a thin D key by eid
+    let (pmap, names) = person_tab(lp);
     let person = |u: u64| pmap.get(u).unwrap_or(u);
-
-    // 2: clicks by person; events deduped, then by person
-    let (fc, fd) = (
-        || {
-            chunks(&cf)
-                .par_iter()
-                .map(|&(d, h)| {
-                    let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
-                    scan::<4>(d, h, |f| {
-                        if f[0].is_empty() || f[1].is_empty() {
-                            return;
-                        }
-                        let Some(ts) = parse_ts(f[3]) else { return };
-                        if ts < ws - WEEK || ts >= we {
-                            return;
-                        }
-                        let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
-                        v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
-                    });
-                    let mut b = Bk::new(v.len());
-                    let mut w = Wc::new();
-                    for i in 0..v.len() {
-                        if let Some(n) = v.get(i + PF) {
-                            pmap.prefetch(n.person);
-                        }
-                        let mut c = v[i];
-                        c.person = person(c.person);
-                        w.push(&mut b, (c.person >> (64 - PB)) as usize, c);
+    lap("links");
+    assert!(ech.len() < 4095, "too many chunks for 12-bit chunk ids");
+    let s1: Vec<(Bk<R>, Bk<D>)> = ech
+        .par_iter()
+        .enumerate()
+        .map(|(ci, &(d, h))| {
+            assert!(d.len() < 1 << 24, "chunk too long for 24-bit user_id offsets");
+            let (mut br, mut bd) = (Bk::new(d.len() / 70), Bk::new(d.len() / 70));
+            WC2.with_borrow_mut(|w| {
+                let (wr, wd) = w.get_or_insert_with(|| (Wc::new(), Wc::new()));
+                wr.t.fill(0);
+                wd.t.fill(0);
+                let fin = |e: &Ev, wr: &mut Wc<R>, wd: &mut Wc<D>, br: &mut Bk<R>, bd: &mut Bk<D>| {
+                    let (mut at, mut pp) = (u32::MAX, 0u64);
+                    if e.ts != BAD {
+                        let q = person(e.uh);
+                        let b = (q >> (64 - PB)) as usize;
+                        let t = wr.t[b];
+                        assert!(t < 1 << 20, "partition too big for 20-bit row ids");
+                        (at, pp) = ((ci as u32) << 20 | t, b as u64);
+                        wr.push(br, b, R { person: q, ts: e.ts, pc: e.pc, ci: ci as u32, off: e.off });
                     }
-                    w.finish(&mut b);
-                    b
-                })
-                .collect::<Vec<_>>()
-        },
-        || {
-            // 32 jobs of P / 32 partitions, each filling one output: one bucket set per job, not per partition
-            (0..32)
-                .into_par_iter()
-                .map(|k| {
-                    let ps = k * P / 32..(k + 1) * P / 32;
-                    let mut b = Bk::new(ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum());
-                    let mut w = Wc::new();
-                    for p in ps {
-                    SCRATCH.with_borrow_mut(|(tab, best, bc)| {
-                    let n: usize = s1.iter().map(|c| c.len(p)).sum();
+                    wd.push(bd, (e.eid >> (64 - PB)) as usize, D { eid: e.eid & LOW | pp << (64 - PB), ingest: e.ingest, at });
+                };
+                // person lookups run PF events behind the parse, so their table lines are prefetched
+                let (mut ring, mut k) = ([Ev::default(); PF], 0usize);
+                scan::<7>(d, h, |f| {
+                    if let Some(e) = event(f, &cx, d.as_ptr()) {
+                        if e.ts != BAD {
+                            pmap.prefetch(e.uh);
+                        }
+                        let old = std::mem::replace(&mut ring[k % PF], e);
+                        if k >= PF {
+                            fin(&old, wr, wd, &mut br, &mut bd);
+                        }
+                        k += 1;
+                    }
+                });
+                for i in k.saturating_sub(PF)..k {
+                    fin(&ring[i % PF], wr, wd, &mut br, &mut bd);
+                }
+                wr.finish(&mut br);
+                wd.finish(&mut bd);
+            });
+            (br, bd)
+        })
+        .collect();
+    lap("links + events parsed");
+
+    // 2: clicks by person; events deduped on the thin keys, losing copies' R rows marked KILL in place
+    let fc = || {
+        chunks(&cf)
+            .par_iter()
+            .map(|&(d, h)| {
+                let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
+                scan::<4>(d, h, |f| {
+                    if f[0].is_empty() || f[1].is_empty() {
+                        return;
+                    }
+                    let Some(ts) = parse_ts(f[3]) else { return };
+                    if ts < ws - WEEK || ts >= we {
+                        return;
+                    }
+                    let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
+                    v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
+                });
+                let mut b = Bk::new(v.len());
+                let mut w = Wc::new();
+                for i in 0..v.len() {
+                    if let Some(n) = v.get(i + PF) {
+                        pmap.prefetch(n.person);
+                    }
+                    let mut c = v[i];
+                    c.person = person(c.person);
+                    w.push(&mut b, (c.person >> (64 - PB)) as usize, c);
+                }
+                w.finish(&mut b);
+                b
+            })
+            .collect::<Vec<_>>()
+    };
+    let kill = |d: &D| {
+        if d.at != u32::MAX {
+            let (bk, pp, t) = (&s1[(d.at >> 20) as usize].0, (d.eid >> (64 - PB)) as usize, (d.at & 0xF_FFFF) as usize);
+            let [m, sp] = bk.get(pp);
+            let r = if t < m.len() { &m[t] } else { &sp[t - m.len()] };
+            // each row is killed by the one job that owns its eid: no two threads write the same row
+            unsafe { std::ptr::write_volatile(std::ptr::addr_of!(r.ts) as *mut u32, KILL) }
+        }
+    };
+    let fd = || {
+        (0..32).into_par_iter().for_each(|k| {
+            for p in k * P / 32..(k + 1) * P / 32 {
+                SCRATCH.with_borrow_mut(|(tab, best)| {
+                    let n: usize = s1.iter().map(|c| c.1.len(p)).sum();
                     let cap = (n * 2).next_power_of_two().max(16);
-                    // reused per thread: no fresh mmap, page faults and munmap for every partition
                     tab.clear();
-                    // slot = tag (top eid bits under the partition) << rb | row in best; all ones = empty
-                    // (rows < n < 2^rb never reach it). 4 B slots: the table stays in L2
+                    // slot = tag (eid bits under the partition) << rb | row in best; all ones = empty
                     let rb = usize::BITS - n.leading_zeros();
                     assert!(rb <= 24, "partition too big for 32-bit dedup slots");
                     let rmask = (1u32 << rb) - 1;
                     tab.resize(cap, u32::MAX);
                     best.clear();
                     best.reserve(n);
-                    bc.clear();
-                    let mut ahead = s1.iter().flat_map(|c| c.get(p)).flatten().skip(PF);
-                    for (ci, e) in s1.iter().enumerate().flat_map(|(ci, c)| c.get(p).into_iter().flatten().map(move |e| (ci as u16, e))) {
+                    let mut ahead = s1.iter().flat_map(|c| c.1.get(p)).flatten().skip(PF);
+                    for e in s1.iter().flat_map(|c| c.1.get(p)).flatten() {
                         if let Some(a) = ahead.next() {
                             use std::arch::x86_64::*;
                             unsafe { _mm_prefetch(tab.as_ptr().add(a.eid as usize & (cap - 1)) as *const i8, _MM_HINT_T0) }
@@ -1086,56 +1125,30 @@ fn main() {
                             if t == u32::MAX {
                                 tab[h] = tag | best.len() as u32;
                                 best.push(*e);
-                                bc.push(ci);
                                 break;
                             }
-                            if t & !rmask == tag && best[(t & rmask) as usize].eid == e.eid {
+                            if t & !rmask == tag && (best[(t & rmask) as usize].eid ^ e.eid) & LOW == 0 {
                                 let b = &mut best[(t & rmask) as usize];
+                                // earliest ingest wins, ties to the first seen (chunk order, then row order)
                                 if e.ingest < b.ingest {
+                                    kill(b);
                                     *b = *e;
-                                    bc[(t & rmask) as usize] = ci;
+                                } else {
+                                    kill(e);
                                 }
                                 break;
                             }
                             h = (h + 1) & (cap - 1);
                         }
                     }
-                    let user = |e: &Ev| e.uh;
-                    let mut ring = [0u64; PF]; // user hashes of the next PF rows, already prefetched
-                    for (r, e) in ring.iter_mut().zip(best.iter()) {
-                        *r = user(e);
-                        pmap.prefetch(*r);
-                    }
-                    for i in 0..best.len() {
-                        let u = ring[i % PF];
-                        if let Some(n) = best.get(i + PF) {
-                            ring[i % PF] = user(n);
-                            pmap.prefetch(ring[i % PF]);
-                        }
-                        let e = &best[i];
-                        if e.ts == BAD {
-                            continue;
-                        }
-                        let q = person(u);
-                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
-                    }
-                    });
-                    }
-                    w.finish(&mut b);
-                    b
-                })
-                .collect::<Vec<_>>()
-        },
-    );
-    let (cl, s2) = if std::env::var("SEQ").is_ok() {
-        let cl = fc();
-        lap("clicks parsed");
-        (cl, fd())
-    } else {
-        rayon::join(fc, fd)
+                });
+            }
+        })
     };
+    let (cl, ()) = rayon::join(fc, fd);
     lap("clicks parsed, events deduped");
-    drop(s1);
+    let (s2, sd): (Vec<Bk<R>>, Vec<Bk<D>>) = s1.into_iter().unzip();
+    drop(sd);
     lap("s1 dropped");
 
     // 3: per person partition: sessions, credit, assists, daily rows
@@ -1147,7 +1160,7 @@ fn main() {
         camp: Vec<[i64; 4]>, // sessions, purchasing, revenue, assisted; index camp * ndays + day
         seen: Vec<u32>,
         stamp: u32,
-        ev: Vec<Ev2>, // sort buffers, reused across partitions: no fresh pages to zero each time
+        ev: Vec<R>, // sort buffers, reused across partitions: no fresh pages to zero each time
         ck: Vec<Cl>,
     }
     let ud = out.join("user_daily");
@@ -1166,6 +1179,10 @@ fn main() {
                     while j < ev.len() && ev[j].person == pk {
                         j += 1;
                     }
+                    let next = j;
+                    while j > i && ev[j - 1].ts == KILL {
+                        j -= 1; // losing copies sort last
+                    }
                     while ci < ck.len() && ck[ci].person < pk {
                         ci += 1;
                     }
@@ -1174,7 +1191,11 @@ fn main() {
                         ci += 1;
                     }
                     let pc = &ck[c0..ci];
-                    let name = *names.get(&pk).unwrap_or(&ev[i].loc);
+                    if j == i {
+                        i = next;
+                        continue;
+                    }
+                    let name = names.get(&pk).copied().unwrap_or_else(|| uloc(ech[ev[i].ci as usize].0, ev[i].off));
                     let (mut lo, mut hi) = (0, 0);
                     let mut row: Option<URow> = None;
                     let mut cats: Vec<(u32, i64)> = vec![];
@@ -1244,7 +1265,7 @@ fn main() {
                         r.top = top(&mut cats);
                         st.rows.push(r);
                     }
-                    i = j;
+                    i = next;
                 }
                 (st.ev, st.ck) = (ev, ck);
                 st
