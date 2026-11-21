@@ -152,7 +152,7 @@ const PF: usize = 16; // prefetch distance in rows
 thread_local! {
     static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
-    static SCRATCH: std::cell::RefCell<(Vec<u64>, Vec<Ev>)> = Default::default();
+    static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<Ev>)> = Default::default();
 }
 
 #[inline(always)]
@@ -912,7 +912,12 @@ fn main() {
                     let cap = (n * 2).next_power_of_two().max(16);
                     // reused per thread: no fresh mmap, page faults and munmap for every partition
                     tab.clear();
-                    tab.resize(cap, u64::MAX); // tag (eid bits 24..56) << 32 | row in best
+                    // slot = tag (top eid bits under the partition) << rb | row in best; all ones = empty
+                    // (rows < n < 2^rb never reach it). 4 B slots: the table stays in L2
+                    let rb = usize::BITS - n.leading_zeros();
+                    assert!(rb <= 24, "partition too big for 32-bit dedup slots");
+                    let rmask = (1u32 << rb) - 1;
+                    tab.resize(cap, u32::MAX);
                     best.clear();
                     best.reserve(n);
                     let mut ahead = s1.iter().flat_map(|c| c.get(p)).flatten().skip(PF);
@@ -921,16 +926,16 @@ fn main() {
                             use std::arch::x86_64::*;
                             unsafe { _mm_prefetch(tab.as_ptr().add(a.eid as usize & (cap - 1)) as *const i8, _MM_HINT_T0) }
                         }
-                        let (tag, mut h) = ((e.eid >> 24) as u32, e.eid as usize & (cap - 1));
+                        let (tag, mut h) = (((e.eid >> (64 - PB - 32)) as u32) & !rmask, e.eid as usize & (cap - 1));
                         loop {
                             let t = tab[h];
-                            if t == u64::MAX {
-                                tab[h] = (tag as u64) << 32 | best.len() as u64;
+                            if t == u32::MAX {
+                                tab[h] = tag | best.len() as u32;
                                 best.push(*e);
                                 break;
                             }
-                            if (t >> 32) as u32 == tag && best[t as u32 as usize].eid == e.eid {
-                                let b = &mut best[t as u32 as usize];
+                            if t & !rmask == tag && best[(t & rmask) as usize].eid == e.eid {
+                                let b = &mut best[(t & rmask) as usize];
                                 if e.ingest < b.ingest {
                                     *b = *e;
                                 }
