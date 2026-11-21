@@ -664,7 +664,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
 }
 
 /// Links -> (id hash -> person key, person key -> name loc). Person key = hash of the person's name.
-fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
+fn persons(files: &[&'static [u8]]) -> (Tab, Tab) {
     person_tab(pairs(files))
 }
 
@@ -685,7 +685,7 @@ fn pairs(files: &[&'static [u8]]) -> Vec<[(u64, u64); 2]> {
 }
 
 // sequential union-find: runs beside event parsing, so it is off the critical path
-fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
+fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Tab) {
     let t = std::time::Instant::now();
     let pr = |w: &str| if std::env::var("PROF").is_ok() { eprintln!("  persons {w} {:.1} ms", t.elapsed().as_secs_f64() * 1e3) };
     let mut idx = Tab::new(pairs.len() * 2); // id hash -> index
@@ -757,14 +757,14 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
             (*s.add(i)).1 = key; // each id owns its slot: disjoint writes
         }
     });
-    let names: Map<u64> = (0..n)
-        .into_par_iter()
-        .filter(|&x| root[x] as usize == x)
-        .map(|x| {
+    // person key -> name loc, a flat table so phase 3 can prefetch it
+    let mut names = Tab::new((0..n).filter(|&x| root[x] as usize == x).count());
+    for x in 0..n {
+        if root[x] as usize == x {
             let (name, key) = ids[best[x].load(Relaxed) as usize];
-            (key, name)
-        })
-        .collect();
+            names.insert(key, name);
+        }
+    }
     pr("maps");
     (idx, names)
 }
@@ -835,7 +835,7 @@ fn main() {
     }
     if std::env::var("LINKS").is_ok() {
         let (pm, nm) = persons(&csvs(&data.join("links")));
-        lap(&format!("links only: {} ids, {} names", pm.s.len() / 2, nm.len()));
+        lap(&format!("links only: {} ids, {} names", pm.s.len() / 2, nm.s.len() / 2));
         return;
     }
     // 1: events by event_id partition, in parallel with links
@@ -1001,6 +1001,9 @@ fn main() {
                 let (mut i, mut ci) = (0, 0);
                 while i < ev.len() {
                     let pk = ev[i].person;
+                    if let Some(a) = ev.get(i + 48) {
+                        names.prefetch(a.person);
+                    }
                     let mut j = i;
                     while j < ev.len() && ev[j].person == pk {
                         j += 1;
@@ -1013,7 +1016,7 @@ fn main() {
                         ci += 1;
                     }
                     let pc = &ck[c0..ci];
-                    let name = *names.get(&pk).unwrap_or(&ev[i].loc);
+                    let name = names.get(pk).unwrap_or(ev[i].loc);
                     let (mut lo, mut hi) = (0, 0);
                     let mut row: Option<URow> = None;
                     let mut cats: Vec<(u32, i64)> = vec![];
