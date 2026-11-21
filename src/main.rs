@@ -771,16 +771,20 @@ fn main() {
     }
     // 1: events by event_id partition, in parallel with links
     let ((pmap, names), s1) = rayon::join(
-        || persons(&csvs(&data.join("links"))),
+        || { let r = persons(&csvs(&data.join("links"))); lap("  links done"); r },
         || {
-            chunks(&csvs(&data.join("events")))
+            let ch = chunks(&csvs(&data.join("events")));
+            lap("  events mapped");
+            let r = ch
                 .par_iter()
                 .map(|&(d, h)| {
                     let mut b = Bk::new(d.len() / 70);
                     scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
                     b
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            lap("  events done");
+            r
         },
     );
     lap("links + events parsed");
