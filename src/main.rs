@@ -786,6 +786,78 @@ impl<T: Copy + Default> Wc<T> {
     }
 }
 
+/// Dedup by event index, written straight from phase 1. Slot i is 32 B (two per cache line):
+/// [key, uh, ts | off << 32, pc], where key = !(ingest << 32 | chunk) of the best row so far
+/// (0 = none yet), so the lowest ingest wins and ties keep the first seen (earlier chunk, or earlier
+/// in the same chunk: one thread walks a chunk in order and only a strictly better row replaces).
+/// A winner rechecks its key after writing the record: if another row won meanwhile, the record may
+/// be torn, so the index goes to `bad` and is rebuilt by rescanning the winning chunk.
+struct Slots {
+    s: &'static [[std::sync::atomic::AtomicU64; 4]],
+    bad: std::sync::Mutex<Vec<u64>>,
+}
+impl Slots {
+    fn new(n: usize) -> Self {
+        // fresh anonymous pages are zero: no fill, and the 2 MB faults run in parallel during phase 1
+        let b = (n.max(1) * 32).next_multiple_of(BIG);
+        unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), b, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+            assert!(p != libc::MAP_FAILED, "slots mmap");
+            libc::madvise(p, b, libc::MADV_HUGEPAGE);
+            Slots { s: std::slice::from_raw_parts(p as *const _, n), bad: Default::default() }
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, i: u64) {
+        use std::arch::x86_64::*;
+        unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.s.as_ptr().add(i as usize) as *const i8) };
+    }
+    #[inline(always)]
+    fn write(&self, i: usize, e: &Ev) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = &self.s[i];
+        r[1].store(e.uh, Relaxed);
+        r[2].store(e.ts as u64 | (e.off as u64) << 32, Relaxed);
+        r[3].store(e.pc as u64, Relaxed);
+    }
+    #[inline(always)]
+    fn put(&self, e: &Ev, ci: usize) {
+        use std::sync::atomic::Ordering::*;
+        let i = e.eid as usize;
+        let s = !((e.ingest as u64) << 32 | ci as u64);
+        let k = &self.s[i][0];
+        let mut old = k.load(Relaxed);
+        loop {
+            if old >= s {
+                return;
+            }
+            match k.compare_exchange_weak(old, s, SeqCst, Relaxed) {
+                Ok(_) => break,
+                Err(o) => old = o,
+            }
+        }
+        self.write(i, e);
+        std::sync::atomic::fence(SeqCst);
+        if k.load(Relaxed) != s {
+            self.bad.lock().unwrap().push(i as u64);
+        }
+    }
+    /// (ingest, chunk) of the surviving row at index i, if any
+    #[inline(always)]
+    fn win(&self, i: usize) -> Option<(u32, usize)> {
+        let s = self.s[i][0].load(std::sync::atomic::Ordering::Relaxed);
+        (s != 0).then(|| ((!s >> 32) as u32, (!s & 0xffff_ffff) as usize))
+    }
+    /// The surviving row at index i as an Ev (eid and ingest left 0)
+    #[inline(always)]
+    fn get(&self, i: usize) -> Ev {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = &self.s[i];
+        let (u, t, p) = (r[1].load(Relaxed), r[2].load(Relaxed), r[3].load(Relaxed));
+        Ev { eid: 0, uh: u, ts: t as u32, ingest: 0, pc: p as u32, off: (t >> 32) as u32 }
+    }
+}
+
 #[inline(always)]
 fn event(f: &[&'static [u8]; 7], cx: &Ctx, base: *const u8) -> Option<(usize, Ev)> {
     if f[0].is_empty() {
@@ -1178,7 +1250,9 @@ fn main() {
     }
     lap("keys");
     let cx = cx;
-    let ((pt, (pmap, names)), s1) = rayon::join(
+    // decoded events go straight to their index slot; the rest (all events, without an event key) to s1
+    let slots = cx.ek.map(|_| Slots::new(cx.eb as usize));
+    let ((pt, (pmap, names)), (s1, odd)): (_, (Vec<Bk<Ev>>, Vec<Vec<Ev>>)) = rayon::join(
         || {
             let (pt, lp) = match cx.uk {
                 Some(k) => links_fast(&lf, k, cx.nb),
@@ -1191,8 +1265,33 @@ fn main() {
         },
         || {
             ech.par_iter()
-                .map(|&(d, h)| {
+                .enumerate()
+                .map(|(ci, &(d, h))| {
                     assert!(d.len() < 1 << 24, "chunk too long for 24-bit user_id offsets");
+                    if let Some(sl) = &slots {
+                        // rows are in random index order: prefetch each slot and put it RING rows later,
+                        // in order (first seen within the chunk keeps ties)
+                        const RING: usize = 16;
+                        let (mut odd, mut ring, mut n) = (vec![], [Ev::default(); RING], 0usize);
+                        scan::<7>(d, h, |f| {
+                            if let Some((p, e)) = event(f, &cx, d.as_ptr()) {
+                                if p == P - 1 {
+                                    odd.push(e);
+                                } else {
+                                    sl.prefetch(e.eid);
+                                    if n >= RING {
+                                        sl.put(&ring[n % RING], ci);
+                                    }
+                                    ring[n % RING] = e;
+                                    n += 1;
+                                }
+                            }
+                        });
+                        for k in n.saturating_sub(RING)..n {
+                            sl.put(&ring[k % RING], ci);
+                        }
+                        return (Bk::exact(&[0; P]), odd);
+                    }
                     let mut b = Bk::new(d.len() / 70);
                     WC.with_borrow_mut(|w| {
                         let w = w.get_or_insert_with(Wc::new);
@@ -1204,12 +1303,47 @@ fn main() {
                         });
                         w.finish(&mut b);
                     });
-                    b
+                    (b, vec![])
                 })
-                .collect::<Vec<_>>()
+                .unzip()
         },
     );
     lap("links + events parsed");
+    if let Some(sl) = &slots {
+        // torn records: rebuild each from the first row of its winning (ingest, chunk)
+        if std::env::var("CFTEST").is_ok() {
+            // test: rebuild every slot, scrambling its record first
+            let mut b = sl.bad.lock().unwrap();
+            for i in 0..cx.eb as usize {
+                if sl.win(i).is_some() {
+                    sl.write(i, &Ev { ts: 7, ..Default::default() });
+                    b.push(i as u64);
+                }
+            }
+        }
+        let mut bad: Vec<(usize, u64, u32)> = sl.bad.lock().unwrap().iter().map(|&i| { let (g, c) = sl.win(i as usize).unwrap(); (c, i, g) }).collect();
+        bad.sort_unstable();
+        bad.dedup();
+        if std::env::var("DIAG").is_ok() {
+            eprintln!("DIAG slot conflicts {}", bad.len());
+        }
+        bad.chunk_by(|a, b| a.0 == b.0).collect::<Vec<_>>().par_iter().for_each(|g| {
+            let (d, h) = ech[g[0].0];
+            let mut done = vec![false; g.len()];
+            scan::<7>(d, h, |f| {
+                if let Some((p, e)) = event(f, &cx, d.as_ptr()) {
+                    if p < P - 1 {
+                        if let Some(k) = (0..g.len()).find(|&k| !done[k] && g[k].1 == e.eid && g[k].2 == e.ingest) {
+                            done[k] = true;
+                            sl.write(e.eid as usize, &e);
+                        }
+                    }
+                }
+            });
+            assert!(done.iter().all(|&x| x), "slot conflict row not found");
+        });
+        lap("slot conflicts");
+    }
     let person = |u: u64| pmap.get(u).unwrap_or(u);
     // fast person: (key, loc) where the loc is person << 9 | label with no length bits (real locs have some)
     let fkey = |n: u64| -> Option<(u64, u64)> {
@@ -1495,7 +1629,10 @@ fn main() {
         let rc: Vec<AtomicU32> = (0..cx.nb).into_par_iter().map(|_| AtomicU32::new(0)).collect();
         let fastv = |e: &Ev| if e.uh & FAST != 0 { fkey(e.uh & !FAST).map(|r| r.1) } else { None };
         // fast survivors go to one big buffer (huge pages, no regrowth), each partition to its own exact-size slice
-        let off: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, j| { *a += s1.iter().map(|c| c.len(j)).sum::<usize>(); Some(*a) })).collect();
+        let slt = slots.as_ref().unwrap();
+        // index range of partition j < P - 1
+        let rng = |j: usize| (j as u64 * cx.ew).min(cx.eb)..if j == P - 2 { cx.eb } else { ((j as u64 + 1) * cx.ew).min(cx.eb) };
+        let off: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, j| { *a += if j < P - 1 { rng(j).count() } else { 0 }; Some(*a) })).collect();
         let mut fbuf: Vec<Ev2> = Vec::with_capacity(off[P]);
         let fb = fbuf.as_mut_ptr() as usize;
         let (cl, pa) = seqjoin(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
@@ -1507,7 +1644,7 @@ fn main() {
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                         best.clear();
                         bc.clear();
-                        let rows = s1.iter().enumerate().flat_map(|(ci, c)| c.get(j).into_iter().flatten().map(move |e| (ci as u16, e)));
+                        let rows = odd.iter().enumerate().flat_map(|(ci, v)| v.iter().map(move |e| (ci as u16, e)));
                         let mut keep = |t: Option<u32>, ci: u16, e: &Ev| -> Option<u32> {
                             match t {
                                 None => {
@@ -1525,21 +1662,14 @@ fn main() {
                             }
                         };
                         if j < P - 1 {
-                            tab.clear();
-                            let base = j as u64 * cx.ew;
-                            tab.resize(if j == P - 2 { cx.eb.saturating_sub(base) } else { cx.ew } as usize, u32::MAX);
-                            for (ci, e) in rows {
-                                let k = (e.eid - base) as usize;
-                                if let Some(n) = keep((tab[k] != u32::MAX).then_some(tab[k]), ci, e) {
-                                    tab[k] = n;
-                                }
-                            }
+                            let _ = tab;
                             let mut last = u64::MAX;
-                            for &t in tab.iter() {
-                                if t == u32::MAX || best[t as usize].ts == BAD {
+                            for i in rng(j) {
+                                let Some((_, ci)) = slt.win(i as usize) else { continue };
+                                let e = &slt.get(i as usize);
+                                if e.ts == BAD {
                                     continue;
                                 }
-                                let e = &best[t as usize];
                                 match fastv(e) {
                                     Some(v) => {
                                         if v >> 9 != last {
@@ -1551,7 +1681,7 @@ fn main() {
                                         nf += 1;
                                     }
                                     None => {
-                                        let (q, l) = ekey(e, bc[t as usize] as usize);
+                                        let (q, l) = ekey(e, ci);
                                         sl.push(Ev2 { person: q, loc: l, ts: e.ts, pc: e.pc });
                                     }
                                 }
