@@ -69,28 +69,33 @@ pub fn enc(pre: u8, n: u64, key: u64, out: &mut Vec<u8>) {
     out.extend_from_slice(&b[i..]);
 }
 
-/// User key from sampled user_ids: the most frequent IDs are the first few persons' alias 0
-/// (n = i * 512); a candidate must decode almost every distinct sampled ID below `bound` persons.
-pub fn user_key(freq: &[&[u8]], distinct: &[&[u8]], bound: u64) -> Option<u64> {
-    let ok = |k: u64, ids: &[&[u8]]| ids.iter().filter(|s| id(s, b'u', k).is_some_and(|n| n >> 9 < bound)).count();
+/// Key search: for each anchor ID and each candidate number n behind it, the key that maps n to the
+/// anchor; accepted if the distinct sampled IDs decode to numbers that `fit` (>= 95% of the first 64,
+/// >= 97% of all). The first anchor with a fitting key decides; two fitting keys: None.
+fn search(anchors: &[&[u8]], pre: u8, ns: &[u64], ids: &[&[u8]], fit: impl Fn(u64) -> bool) -> Option<u64> {
+    let first = &ids[..ids.len().min(64)];
     let mut found = None;
-    for s in freq {
-        let Some(y) = s.strip_prefix(b"u").and_then(b36) else { continue };
+    for s in anchors {
+        let Some(y) = s.strip_prefix(&[pre]).and_then(b36) else { continue };
         let mut m = y.wrapping_mul(IB) & M40;
         m ^= m >> 17 ^ m >> 34;
-        for i in 0..64u64 {
-            for a in 0..8u64 {
-                let k = (m ^ ((i * 512 + a).wrapping_mul(A))) & M40;
-                if found == Some(k) {
-                    continue;
+        for &n in ns {
+            let k = (m ^ n.wrapping_mul(A)) & M40;
+            if found == Some(k) {
+                continue;
+            }
+            let mut miss = 0; // the 95% check, stopping at the first miss too many (most keys miss at once)
+            if first.iter().any(|s| {
+                miss += !id(s, pre, k).is_some_and(&fit) as usize;
+                miss * 100 > first.len() * 5
+            }) {
+                continue;
+            }
+            if ids.iter().filter(|s| id(s, pre, k).is_some_and(&fit)).count() * 100 >= ids.len() * 97 {
+                if found.is_some() {
+                    return None; // two keys fit: trust neither
                 }
-                let pre = &distinct[..distinct.len().min(64)];
-                if ok(k, pre) * 100 >= pre.len() * 95 && ok(k, distinct) * 100 >= distinct.len() * 97 {
-                    if found.is_some() {
-                        return None; // two keys fit: trust neither
-                    }
-                    found = Some(k);
-                }
+                found = Some(k);
             }
         }
         if found.is_some() {
@@ -98,6 +103,20 @@ pub fn user_key(freq: &[&[u8]], distinct: &[&[u8]], bound: u64) -> Option<u64> {
         }
     }
     None
+}
+
+/// User key from sampled user_ids: the most frequent IDs are the first few persons' alias 0
+/// (n = i * 512); a candidate must decode almost every distinct sampled ID below `bound` persons.
+pub fn user_key(freq: &[&[u8]], distinct: &[&[u8]], bound: u64) -> Option<u64> {
+    let ns: Vec<u64> = (0..64u64).flat_map(|i| (0..8).map(move |a| i * 512 + a)).collect();
+    search(freq, b'u', &ns, distinct, |n| n >> 9 < bound)
+}
+
+/// Event key: person 0 owns the first event indices in time order, so its earliest sampled events
+/// have small indices (n < 2^16); a candidate must decode almost every sampled event_id below `bound`.
+pub fn event_key(early: &[&[u8]], distinct: &[&[u8]], bound: u64) -> Option<u64> {
+    let ns: Vec<u64> = (0..1 << 16).collect();
+    search(early, b'e', &ns, distinct, |n| n < bound)
 }
 
 #[cfg(test)]
@@ -118,5 +137,22 @@ mod tests {
         assert_eq!(b36(b"0"), Some(0));
         assert_eq!(b36(b"Ab"), None);
         assert_eq!(b36(b"zzzzzzzz"), None); // above 2^40
+    }
+    #[test]
+    fn keys() {
+        let (uk, ek) = (0x3a_5c71_09e2, 0x91_0fd3_2b44);
+        let s = |pre, n, k| {
+            let mut v = vec![];
+            enc(pre, n, k, &mut v);
+            v
+        };
+        let us: Vec<Vec<u8>> = (0..500u64).map(|i| s(b'u', (i * 7919 % 4000) << 9 | i % 3, uk)).collect();
+        let es: Vec<Vec<u8>> = (0..500u64).map(|i| s(b'e', 300 + i * 9973 % 90000, ek)).collect();
+        fn r(v: &[Vec<u8>]) -> Vec<&[u8]> {
+            v.iter().map(|x| &x[..]).collect()
+        }
+        assert_eq!(user_key(&[&s(b'u', 3 << 9, uk)], &r(&us), 4000), Some(uk));
+        assert_eq!(event_key(&[&s(b'e', 300, ek)], &r(&es), 100000), Some(ek));
+        assert_eq!(event_key(&[&s(b'e', 70000, ek)], &r(&es), 100000), None); // anchor index beyond the window
     }
 }
