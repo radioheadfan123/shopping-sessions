@@ -1550,27 +1550,34 @@ fn main() {
         });
         lap("clicks parsed, events deduped by index");
         drop(s1);
+        // clicks whose key is a fast person's, by person number: a job walks persons in that order, so
+        // lookups stay local; the rest by key in hash partitions
+        let vb = cx.nb << 9;
+        let mut fk: Vec<(u64, Cl)> = cl.par_iter().flat_map_iter(|c| (0..P).flat_map(move |q| c.get(q)).flatten().map(|x| (unmix(x.person), *x)).filter(|x| x.0 < vb)).collect();
+        fk.par_sort_unstable_by_key(|x| (x.0, x.1.ts));
+        let fvs: Vec<u64> = fk.par_iter().map(|x| x.0).collect();
+        let fcs: Vec<Cl> = fk.par_iter().map(|x| x.1).collect();
+        drop(fk);
         let cs: Vec<Vec<Cl>> = (0..P)
             .into_par_iter()
             .map(|q| {
-                let mut v = vec![];
-                group(&cl, q, |c| (c.person, c.ts), &mut v);
+                let mut v: Vec<Cl> = cl.iter().flat_map(|c| c.get(q)).flatten().filter(|x| unmix(x.person) >= vb).copied().collect();
+                v.sort_unstable_by_key(|c| (c.person, c.ts));
                 v
             })
             .collect();
-        let clk = |key: u64| -> &[Cl] {
-            let c = &cs[(key >> (64 - PB)) as usize];
-            let a = c.partition_point(|x| x.person < key);
-            &c[a..a + c[a..].partition_point(|x| x.person == key)]
-        };
-        // fast persons' clicks by person number too: a job walks persons in that order, so lookups stay local
-        let vb = cx.nb << 9;
-        let mut fcs: Vec<Cl> = cs.par_iter().flat_map_iter(|c| c.iter().filter(|x| unmix(x.person) < vb).copied()).collect();
-        fcs.par_sort_unstable_by_key(|x| (unmix(x.person), x.ts));
-        let fvs: Vec<u64> = fcs.par_iter().map(|x| unmix(x.person)).collect();
         let fclk = |v: u64| -> &[Cl] {
             let a = fvs.partition_point(|&x| x < v);
             &fcs[a..a + fvs[a..].partition_point(|&x| x == v)]
+        };
+        let clk = |key: u64| -> &[Cl] {
+            let v = unmix(key);
+            if v < vb {
+                return fclk(v);
+            }
+            let c = &cs[(key >> (64 - PB)) as usize];
+            let a = c.partition_point(|x| x.person < key);
+            &c[a..a + c[a..].partition_point(|x| x.person == key)]
         };
         lap("clicks grouped");
         // a person continuing across an index partition edge is one run, not two
