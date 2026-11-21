@@ -309,74 +309,68 @@ fn masks(b: &[u8; 64]) -> (u64, u64, u64) {
 
 /// Calls f with the unquoted fields of every well-formed line of d (exactly N fields, quotes only
 /// around a whole field); skips the first line if header. Same result as lines() + split().
-/// Stage 1 lists every ',' / '\n' of a 16 KB window with the quote count before it, branch-free;
-/// stage 2 walks that list a whole line at a time.
+/// One pass: walks the ',' / '\n' bits of each 64-byte block, with the quote count before each.
 #[inline(always)]
 fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
-    const W: usize = 16 << 10;
     assert!(d.len() < u32::MAX as usize - 128);
-    let mut e: Vec<(u32, u32)> = Vec::with_capacity(W + 128); // (offset, quotes before it)
-    let (mut qtot, mut skip, mut base, mut ls, mut lq) = (0u32, header, 0usize, 0usize, 0u32);
-    let nl = |p: u32| d.get(p as usize).is_none_or(|&c| c == b'\n'); // past the end = the last line's break
-    while base < d.len() {
-        let stop = (base + W).min(d.len());
-        e.reserve(stop - base + 128);
-        let (ep, mut n) = (e.as_mut_ptr(), e.len());
-        while base < stop {
+    // past the data there is always one more '\n' (harmless if the data already ends with one)
+    let end = d.len() + 1;
+    let (mut base, mut qb) = (0usize, 0u32); // block start, quotes before it
+    let load = |base: usize| -> (u64, u64, u64) {
+        if d.len() - base.min(d.len()) >= 64 {
+            masks(d[base..base + 64].try_into().unwrap())
+        } else {
             let mut tmp = [0u8; 64];
-            let blk: &[u8; 64] = if d.len() - base >= 64 {
-                d[base..base + 64].try_into().unwrap()
-            } else {
-                tmp[..d.len() - base].copy_from_slice(&d[base..]);
-                tmp[d.len() - base] = b'\n'; // harmless if the data already ends with one
-                &tmp
-            };
-            let (cm, nm, qm) = masks(blk);
-            let mut b = cm | nm;
-            let cnt = b.count_ones() as usize;
-            let mut u = 0;
-            loop {
-                for _ in 0..8 {
-                    let below = b.wrapping_sub(1) & !b;
-                    unsafe { ep.add(n + u).write(((base as u32).wrapping_add(b.trailing_zeros()), qtot + (qm & below).count_ones())) };
-                    b &= b.wrapping_sub(1);
-                    u += 1;
-                }
-                if u >= cnt {
-                    break;
-                }
-            }
-            n += cnt;
-            qtot += qm.count_ones();
+            let n = d.len() - base;
+            tmp[..n].copy_from_slice(&d[base..]);
+            tmp[n] = b'\n';
+            masks(&tmp)
+        }
+    };
+    let (cm, mut nm, mut qm) = load(0);
+    let mut sep = cm | nm;
+    // next separator: (offset, is '\n', quotes before it); None at the end
+    let mut next = || -> Option<(usize, bool, u32)> {
+        while sep == 0 {
+            qb += qm.count_ones();
             base += 64;
-        }
-        if base == d.len() && d[d.len() - 1] != b'\n' {
-            unsafe { ep.add(n).write((d.len() as u32, qtot)) }; // no break after the last line, and no tail block to add one
-            n += 1;
-        }
-        unsafe { e.set_len(n) };
-        let mut k = 0;
-        while k < e.len() {
-            let Some(j) = e[k..].iter().position(|x| nl(x.0)) else { break }; // line goes on in the next window
-            if j == N - 1 && !skip {
-                let mut fl: [&'static [u8]; N] = [&[]; N];
-                let (mut s, mut q0, mut good) = (ls, lq, true);
-                for (j, &(p, q)) in e[k..k + N].iter().enumerate() {
-                    let x = unsafe { d.get_unchecked(s..(p as usize).min(d.len())) };
-                    let w = q - q0 == 2 && x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"';
-                    good &= q == q0 || w;
-                    fl[j] = if w { &x[1..x.len() - 1] } else { x };
-                    (s, q0) = (p as usize + 1, q);
-                }
-                if good {
-                    f(&fl);
-                }
+            if base >= end {
+                return None;
             }
-            skip = false;
-            (ls, lq) = (e[k + j].0 as usize + 1, e[k + j].1);
-            k += j + 1;
+            let (c, n, q) = load(base);
+            (sep, nm, qm) = (c | n, n, q);
         }
-        e.drain(..k);
+        let t = sep.trailing_zeros();
+        let below = sep.wrapping_sub(1) & !sep;
+        sep &= sep.wrapping_sub(1);
+        Some((base + t as usize, nm >> t & 1 != 0, qb + (qm & below).count_ones()))
+    };
+    let (mut ls, mut lq, mut skip) = (0usize, 0u32, header);
+    'line: loop {
+        let mut fl: [&'static [u8]; N] = [&[]; N];
+        let (mut s, mut q0, mut good) = (ls, lq, true);
+        for j in 0..N {
+            let Some((p, nl, q)) = next() else { return };
+            let x = unsafe { d.get_unchecked(s..p.min(d.len())) };
+            let w = q - q0 == 2 && x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"';
+            good &= q == q0 || w;
+            fl[j] = if w { &x[1..x.len() - 1] } else { x };
+            (s, q0) = (p + 1, q);
+            if nl != (j == N - 1) {
+                // too few fields (line ended early) or too many (skip to the line's end)
+                let (mut p, mut q, mut nl) = (p, q, nl);
+                while !nl {
+                    let Some(t) = next() else { return };
+                    (p, nl, q) = t;
+                }
+                (ls, lq, skip) = (p + 1, q, false);
+                continue 'line;
+            }
+        }
+        if good && !skip {
+            f(&fl);
+        }
+        (ls, lq, skip) = (s, q0, false);
     }
 }
 
