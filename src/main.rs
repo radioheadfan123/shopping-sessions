@@ -390,8 +390,8 @@ fn scan_old<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[
 /// A quote anywhere but at a field's first or last byte marks the line "odd", and odd lines go to
 /// split() (exact); the rest need only a 2-byte quote check per field.
 #[inline(always)]
-#[allow(unused_assignments)]
-fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
+#[allow(unused_assignments, dead_code)]
+fn scan_blk<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
     let len = d.len();
     let mut fl: [&'static [u8]; N] = [&[]; N];
     let (mut k, mut good, mut odd, mut skip) = (0usize, true, false, header);
@@ -455,6 +455,58 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
     if len % 64 == 0 && len > 0 && d[len - 1] != b'\n' {
         field!(len);
         eol!(len);
+    }
+}
+
+/// Same contract as scan_blk, a line at a time: masks of the 128 bytes from the line start, the
+/// line ends at the first '\n', and its N fields pop off the separator mask with no data-dependent
+/// loop. A line with the wrong separator count or a quote off a field edge goes to split() (exact).
+#[inline(always)]
+fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
+    let len = d.len();
+    let mut s = if header { memchr(b'\n', d).map_or(len, |p| p + 1) } else { 0 };
+    let mut fl: [&'static [u8]; N] = [&[]; N];
+    while s + 128 <= len {
+        let (c0, n0, q0) = masks(d[s..s + 64].try_into().unwrap());
+        let (c1, n1, q1) = masks(d[s + 64..s + 128].try_into().unwrap());
+        let nm = n0 as u128 | (n1 as u128) << 64;
+        if nm == 0 {
+            let e = memchr(b'\n', &d[s..]).map_or(len, |p| s + p); // over 127 bytes
+            if split(&d[s..e], &mut fl) {
+                f(&fl);
+            }
+            s = e + 1;
+            continue;
+        }
+        let e = nm.trailing_zeros() as usize;
+        let upto = (2u128 << e).wrapping_sub(1);
+        let sep = (c0 as u128 | (c1 as u128) << 64 | nm) & upto;
+        let qm = (q0 as u128 | (q1 as u128) << 64) & upto;
+        if sep.count_ones() as usize == N && qm & !(sep << 1 | sep >> 1 | 1) == 0 {
+            let (mut bits, mut st, mut good) = (sep, s, true);
+            for k in 0..N {
+                let p = s + bits.trailing_zeros() as usize;
+                let x = unsafe { d.get_unchecked(st..p) };
+                let (a, z) = (x.first() == Some(&b'"'), x.last() == Some(&b'"'));
+                good &= a == z && (!a || x.len() >= 2);
+                fl[k] = if a && x.len() >= 2 { unsafe { x.get_unchecked(1..x.len() - 1) } } else { x };
+                bits &= bits.wrapping_sub(1);
+                st = p + 1;
+            }
+            if good {
+                f(&fl);
+            }
+        } else if split(&d[s..s + e], &mut fl) {
+            f(&fl);
+        }
+        s += e + 1;
+    }
+    if s < len {
+        lines(&d[s..], false, |l| {
+            if split(l, &mut fl) {
+                f(&fl)
+            }
+        });
     }
 }
 
