@@ -150,7 +150,7 @@ impl Tab {
 const PF: usize = 16; // prefetch distance in rows
 
 thread_local! {
-    static WC: std::cell::RefCell<Option<Wc>> = const { std::cell::RefCell::new(None) };
+    static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
     static SCRATCH: std::cell::RefCell<(Vec<u64>, Vec<Ev>)> = Default::default();
 }
@@ -495,7 +495,7 @@ fn price(s: &[u8]) -> Option<u32> {
 }
 
 /// Event as parsed: ts is ms after window_start, BAD if the event fails validation.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Ev {
     // 40 B: Wc streams 8 rows as 5 whole cache lines
     eid: u64,
@@ -507,7 +507,7 @@ struct Ev {
 }
 
 /// Valid, deduped event, keyed by person.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Ev2 {
     person: u64,
     loc: u64,
@@ -515,7 +515,7 @@ struct Ev2 {
     pc: u32, // as in Ev
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Cl {
     person: u64,
     cid: u64, // loc of click_id, for ties
@@ -580,16 +580,18 @@ impl<T: Copy> Bk<T> {
 
 /// Write-combining front for a phase 1 Bk<Ev>: 8 rows per partition staged in cache, then
 /// flushed with non-temporal stores (no read-for-ownership of the destination lines).
-struct Wc {
-    buf: Vec<[Ev; 8]>,
+struct Wc<T> {
+    buf: Vec<[T; 8]>,
     t: Vec<u32>,
 }
-impl Wc {
+impl<T: Copy + Default> Wc<T> {
+    const L: usize = 8 * std::mem::size_of::<T>() / 16; // 16 B stores per 8 rows
     fn new() -> Self {
-        Wc { buf: vec![[Ev { eid: 0, loc: 0, uh: 0, ts: 0, ingest: 0, pc: 0 }; 8]; P], t: vec![0; P] }
+        assert!(8 * std::mem::size_of::<T>() % 64 == 0);
+        Wc { buf: vec![[T::default(); 8]; P], t: vec![0; P] }
     }
     #[inline(always)]
-    fn push(&mut self, bk: &mut Bk<Ev>, b: usize, e: Ev) {
+    fn push(&mut self, bk: &mut Bk<T>, b: usize, e: T) {
         let t = self.t[b] as usize;
         self.buf[b][t & 7] = e;
         self.t[b] += 1;
@@ -601,11 +603,11 @@ impl Wc {
                     let d = bk.v.as_mut_ptr().add(b * bk.cap + k) as *mut __m128i;
                     let s = self.buf[b].as_ptr() as *const __m128i;
                     if d as usize % 64 == 0 {
-                        for i in 0..20 {
+                        for i in 0..Self::L {
                             _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
                         }
                     } else {
-                        std::ptr::copy_nonoverlapping(s, d, 20);
+                        std::ptr::copy_nonoverlapping(s, d, Self::L);
                     }
                 }
                 bk.n[b] = (k + 8) as u32;
@@ -614,7 +616,7 @@ impl Wc {
             }
         }
     }
-    fn finish(&self, bk: &mut Bk<Ev>) {
+    fn finish(&self, bk: &mut Bk<T>) {
         unsafe { std::arch::x86_64::_mm_sfence() };
         for b in 0..P {
             let t = self.t[b] as usize;
@@ -851,14 +853,16 @@ fn main() {
                         v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
                     });
                     let mut b = Bk::new(v.len());
+                    let mut w = Wc::new();
                     for i in 0..v.len() {
                         if let Some(n) = v.get(i + PF) {
                             pmap.prefetch(n.person);
                         }
                         let mut c = v[i];
                         c.person = person(c.person);
-                        b.push((c.person >> (64 - PB)) as usize, c);
+                        w.push(&mut b, (c.person >> (64 - PB)) as usize, c);
                     }
+                    w.finish(&mut b);
                     b
                 })
                 .collect::<Vec<_>>()
@@ -870,6 +874,7 @@ fn main() {
                 .map(|k| {
                     let ps = k * P / 32..(k + 1) * P / 32;
                     let mut b = Bk::new(ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum());
+                    let mut w = Wc::new();
                     for p in ps {
                     SCRATCH.with_borrow_mut(|(tab, best)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
@@ -920,10 +925,11 @@ fn main() {
                             continue;
                         }
                         let q = person(u);
-                        b.push((q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
+                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
                     }
                     });
                     }
+                    w.finish(&mut b);
                     b
                 })
                 .collect::<Vec<_>>()
