@@ -34,17 +34,23 @@ pub fn b36(s: &[u8]) -> Option<u64> {
     if s.is_empty() || s.len() > 8 || (s[0] == b'0' && s.len() > 1) {
         return None;
     }
-    let mut v = 0u64;
+    let (mut v, mut bad) = (0u64, 0u8); // branch free: digits are mixed, so branches mispredict
     for &c in s {
-        let d = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'z' => c - b'a' + 10,
-            _ => return None,
-        };
-        v = v * 36 + d as u64;
+        let d = D36[c as usize];
+        bad |= d;
+        v = v * 36 + d as u64; // at most 8 digits of 255: no overflow
     }
-    (v <= M40).then_some(v)
+    (bad < 128 && v <= M40).then_some(v)
 }
+const D36: [u8; 256] = {
+    let mut t = [255u8; 256];
+    let mut i = 0;
+    while i < 36 {
+        t[if i < 10 { b'0' + i } else { b'a' + i - 10 } as usize] = i;
+        i += 1;
+    }
+    t
+};
 /// The number behind a canonical prefixed ID.
 #[inline(always)]
 pub fn id(s: &[u8], pre: u8, key: u64) -> Option<u64> {

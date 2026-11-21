@@ -1459,7 +1459,7 @@ fn main() {
             (0..P)
                 .into_par_iter()
                 .map(|j| {
-                    let (mut fv, mut sl) = (vec![], vec![]); // fast survivors (index order), slow ones
+                    let (mut fv, mut sl, mut nr) = (vec![], vec![], 0usize); // fast survivors (index order), slow ones, runs
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                         best.clear();
                         bc.clear();
@@ -1500,6 +1500,7 @@ fn main() {
                                     Some(v) => {
                                         if v >> 9 != last {
                                             last = v >> 9;
+                                            nr += 1;
                                             rc[last as usize].fetch_add(1, Relaxed);
                                         }
                                         fv.push(Ev2 { person: v, loc: v, ts: e.ts, pc: e.pc });
@@ -1534,7 +1535,7 @@ fn main() {
                             }
                         }
                     });
-                    (fv, sl)
+                    (fv, sl, nr)
                 })
                 .collect::<Vec<_>>()
         });
@@ -1563,8 +1564,8 @@ fn main() {
             }
         }
         // clean runs, 32 jobs over the index partitions; a run crossing edges belongs to the partition it starts in
-        // jobs split by survivor count: survivors cluster unevenly over the index range
-        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len(); Some(*a) })).collect();
+        // jobs split by estimated cost: low indices hold heavy persons, high ones many light persons
+        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len() + 64 * x.2; Some(*a) })).collect();
         let jb: Vec<usize> = (0..=32).map(|k| if k == 32 { P - 1 } else { cum.partition_point(|&c| c * 32 < k * cum[P - 1]) }).collect();
         let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
             .into_par_iter()
