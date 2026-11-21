@@ -198,6 +198,12 @@ fn map(path: &Path) -> &'static [u8] {
     }
 }
 
+/// Map a chunk's pages in one call instead of one fault at a time (MADV_POPULATE_READ, Linux 5.14+; an ignored error before).
+fn pop(d: &[u8]) {
+    let a = d.as_ptr() as usize & !4095;
+    unsafe { libc::madvise(a as *mut libc::c_void, d.as_ptr() as usize + d.len() - a, 22) };
+}
+
 fn csvs(dir: &Path) -> Vec<&'static [u8]> {
     let mut v: Vec<_> = std::fs::read_dir(dir)
         .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).collect())
@@ -734,6 +740,7 @@ fn main() {
             chunks(&csvs(&data.join("events")))
                 .par_iter()
                 .map(|&(d, h)| {
+                    pop(d);
                     let mut b = Bk::new(d.len() / 70);
                     scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
                     b
@@ -750,6 +757,7 @@ fn main() {
             chunks(&csvs(&data.join("clicks")))
                 .par_iter()
                 .map(|&(d, h)| {
+                    pop(d);
                     let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
                     scan::<4>(d, h, |f| {
                         if f[0].is_empty() || f[1].is_empty() {
