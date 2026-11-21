@@ -1567,6 +1567,7 @@ fn main() {
             .into_par_iter()
             .map(|k| {
                 let (mut st, mut slow, mut tmp) = (new_st(), vec![], vec![]);
+                let tj = std::time::Instant::now();
                 for j in k * (P - 1) / 32..(k + 1) * (P - 1) / 32 {
                     let f = &pa[j].0;
                     let mut i = 0;
@@ -1621,8 +1622,12 @@ fn main() {
                         }
                     }
                 }
+                let t1 = tj.elapsed().as_secs_f64() * 1e3;
                 if k == 0 || !st.rows.is_empty() {
                     write_user(&ud.join(format!("part-{k}.parquet")), &st.rows, &catnames, base_day);
+                }
+                if std::env::var("PROF").is_ok() {
+                    eprintln!("  job {k} body {t1:.0} ms write {:.0} ms rows {}", tj.elapsed().as_secs_f64() * 1e3 - t1, st.rows.len());
                 }
                 (st.camp, slow)
             })
