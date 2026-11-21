@@ -989,12 +989,12 @@ fn main() {
         ev: Vec<Ev2>, // sort buffers, reused across partitions: no fresh pages to zero each time
         ck: Vec<Cl>,
     }
-    let states: Vec<St> = (0..P)
-        .into_par_iter()
-        .with_min_len(P / 32) // at most 32 states (fold made about 220, each with its own campaign array and part file)
-        .fold(
-            || St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![] },
-            |mut st, q| {
+    let ud = out.join("user_daily");
+    let cd = out.join("campaign_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    std::fs::create_dir_all(&cd).unwrap();
+    let step = |mut st: St, q: usize| -> St {
+            {
                 let (mut ev, mut ck) = (std::mem::take(&mut st.ev), std::mem::take(&mut st.ck));
                 group(&s2, q, |e| (e.person, e.ts), &mut ev);
                 group(&cl, q, |c| (c.person, c.ts), &mut ck);
@@ -1087,31 +1087,35 @@ fn main() {
                 }
                 (st.ev, st.ck) = (ev, ck);
                 st
-            },
-        )
+            }
+    };
+    // 32 jobs of P / 32 partitions; each writes its user_daily part as soon as it is done
+    let states: Vec<Vec<[i64; 4]>> = (0..32)
+        .into_par_iter()
+        .map(|k| {
+            let mut st = St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![] };
+            for q in k * P / 32..(k + 1) * P / 32 {
+                st = step(st, q);
+            }
+            if k == 0 || !st.rows.is_empty() {
+                write_user(&ud.join(format!("part-{k}.parquet")), &st.rows, &catnames, base_day);
+            }
+            st.camp
+        })
         .collect();
 
     lap("sessions");
     // 4: write
-    let ud = out.join("user_daily");
-    let cd = out.join("campaign_daily");
-    std::fs::create_dir_all(&ud).unwrap();
-    std::fs::create_dir_all(&cd).unwrap();
     let mut camp = vec![[0i64; 4]; (ncamp + 1) * ndays];
     for s in &states {
-        for (a, b) in camp.iter_mut().zip(&s.camp) {
+        for (a, b) in camp.iter_mut().zip(s) {
             for t in 0..4 {
                 a[t] += b[t];
             }
         }
     }
-    rayon::join(
-        || {
-            states.par_iter().enumerate().filter(|(i, s)| *i == 0 || !s.rows.is_empty()).for_each(|(i, s)| {
-                write_user(&ud.join(format!("part-{i}.parquet")), &s.rows, &catnames, base_day);
-            })
-        },
-        || {
+    {
+        {
             let mut rows = vec![];
             for c in 0..=ncamp {
                 for d in 0..ndays {
@@ -1123,8 +1127,8 @@ fn main() {
                 }
             }
             write_camp(&cd.join("part-0.parquet"), &rows);
-        },
-    );
+        }
+    }
     lap("written");
 }
 
