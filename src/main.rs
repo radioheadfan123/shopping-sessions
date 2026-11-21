@@ -599,7 +599,7 @@ fn uloc(d: &'static [u8], off: u32) -> u64 {
 #[derive(Clone, Copy, Default)]
 struct Ev2 {
     person: u64,
-    loc: u64,
+    loc: u64, // chunk << 32 | Ev.off; resolved to the user_id only when it names a person
     ts: u32,
     pc: u32, // as in Ev
 }
@@ -1117,7 +1117,7 @@ fn main() {
                             continue;
                         }
                         let q = person(u);
-                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
+                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: (bc[i] as u64) << 32 | e.off as u64, ts: e.ts, pc: e.pc });
                     }
                     });
                     }
@@ -1174,7 +1174,11 @@ fn main() {
                         ci += 1;
                     }
                     let pc = &ck[c0..ci];
-                    let name = *names.get(&pk).unwrap_or(&ev[i].loc);
+                    // the user_id is read back from the input only here, once per unlinked person, not per event
+                    let name = match names.get(&pk) {
+                        Some(&n) => n,
+                        None => uloc(ech[(ev[i].loc >> 32) as usize].0, ev[i].loc as u32),
+                    };
                     let (mut lo, mut hi) = (0, 0);
                     let mut row: Option<URow> = None;
                     let mut cats: Vec<(u32, i64)> = vec![];
