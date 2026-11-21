@@ -1033,6 +1033,7 @@ fn main() {
     );
     let person = |u: u64| pmap.get(u).unwrap_or(u);
     lap("links");
+    let nolook = std::env::var("NOLOOK").is_ok(); // timing probe only: wrong output
     assert!(ech.len() < 4095, "too many chunks for 12-bit chunk ids");
     let s1: Vec<(Bk<R>, Bk<D>)> = ech
         .par_iter()
@@ -1047,7 +1048,7 @@ fn main() {
                 let fin = |e: &Ev, wr: &mut Wc<R>, wd: &mut Wc<D>, br: &mut Bk<R>, bd: &mut Bk<D>| {
                     let (mut at, mut pp) = (u32::MAX, 0u64);
                     if e.ts != BAD {
-                        let q = person(e.uh);
+                        let q = if nolook { e.uh } else { person(e.uh) };
                         let b = (q >> (64 - PB)) as usize;
                         let t = wr.t[b];
                         assert!(t < 1 << 20, "partition too big for 20-bit row ids");
