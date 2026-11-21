@@ -1,6 +1,7 @@
 //! Shopping Sessions pipeline: dirty CSVs -> user_daily + campaign_daily Parquet. Rules: dl/rules.md.
 //! Plan: parse events in parallel, scattered by event_id hash -> dedup per partition -> rescatter
 //! valid events by person -> per person partition: sort, sessionize, attribute clicks, aggregate.
+mod dec;
 use memchr::memchr;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -87,6 +88,18 @@ const WEEK: i64 = 7 * DAY;
 const PB: u32 = 10; // partition bits
 const P: usize = 1 << PB; // partitions, picked by the top PB bits of a hash
 const BAD: u32 = u32::MAX;
+const FAST: u64 = 1 << 63; // Ev.uh: FAST | decoded user number; 0 = take the slow path from the string
+const CPX: u64 = u64::MAX; // person table: this person has a link that is not plain alias-to-alias
+const ID16: u64 = 0xFEDC_BA98_7654_3210; // person table start: each alias < 16 labels itself
+/// Fast person key: a bijective mix of person << 9 | label, so its top bits spread over partitions.
+#[inline(always)]
+fn mix(mut v: u64) -> u64 {
+    v ^= v >> 30;
+    v = v.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    v ^= v >> 27;
+    v = v.wrapping_mul(0x94d0_49bb_1331_11eb);
+    v ^ v >> 31
+}
 fn kn(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
@@ -627,6 +640,8 @@ struct Ctx {
     prod: Map<u32>,
     unknown: u32,
     camps: Map<u32>,
+    uk: Option<u64>, // user key, if recovered
+    nb: u64,         // persons below this decode fast
 }
 
 fn window(json: &str, key: &str) -> i64 {
@@ -764,7 +779,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx, base: *const u8) -> Option<Ev> {
             if ok {
                 e.ts = (ts - cx.ws) as u32;
                 e.off = ((f[1].as_ptr() as usize - base as usize) << 8 | f[1].len().min(255)) as u32;
-                e.uh = hash(f[1]);
+                e.uh = cx.uk.and_then(|k| dec::id(f[1], b'u', k)).filter(|n| n >> 9 < cx.nb).map_or(0, |n| FAST | n);
             }
         }
     }
@@ -790,6 +805,61 @@ fn pairs(files: &[&'static [u8]]) -> Vec<[(u64, u64); 2]> {
             v
         })
         .collect()
+}
+
+/// Links with decoded IDs: a plain alias-to-alias link (same person, both aliases < 16) is a label
+/// union in that person's 16-nibble table; any other link marks every decodable person on it CPX.
+/// Returns the person table and the links the exact union-find still needs: every link not between
+/// two aliases of one plain person.
+fn links_fast(files: &[&'static [u8]], uk: u64, nb: u64) -> (Vec<u64>, Vec<[(u64, u64); 2]>) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let pt: Vec<AtomicU64> = (0..nb).into_par_iter().map(|_| AtomicU64::new(ID16)).collect();
+    let du = |s: &[u8]| dec::id(s, b'u', uk).filter(|n| n >> 9 < nb);
+    let union = |c: &AtomicU64, a: u64, b: u64| {
+        let mut t = c.load(Relaxed);
+        loop {
+            let (la, lb) = (t >> (4 * a) & 15, t >> (4 * b) & 15);
+            if t == CPX || la == lb {
+                return;
+            }
+            let (lo, hi) = (la.min(lb), la.max(lb));
+            let mut n = t;
+            for i in 0..16 {
+                if t >> (4 * i) & 15 == hi {
+                    n = n & !(15 << (4 * i)) | lo << (4 * i);
+                }
+            }
+            match c.compare_exchange_weak(t, n, Relaxed, Relaxed) {
+                Ok(_) => return,
+                Err(x) => t = x,
+            }
+        }
+    };
+    let raw: Vec<Vec<[u64; 2]>> = chunks(files)
+        .par_iter()
+        .map(|&(d, h)| {
+            let mut v = vec![];
+            scan::<2>(d, h, |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                v.push([loc(f[0]), loc(f[1])]);
+                match (du(f[0]), du(f[1])) {
+                    (Some(x), Some(y)) if x >> 9 == y >> 9 && x & 511 < 16 && y & 511 < 16 => union(&pt[(x >> 9) as usize], x & 15, y & 15),
+                    (x, y) => {
+                        for n in [x, y].into_iter().flatten() {
+                            pt[(n >> 9) as usize].store(CPX, Relaxed);
+                        }
+                    }
+                }
+            });
+            v
+        })
+        .collect();
+    let pt: Vec<u64> = pt.into_par_iter().map(|a| a.into_inner()).collect();
+    let plain = |l: u64| du(at(l)).is_some_and(|n| pt[(n >> 9) as usize] != CPX);
+    let kept = raw.par_iter().flat_map_iter(|v| v.iter().filter(|&&[a, b]| !(plain(a) && plain(b))).map(|&[a, b]| [(a, hash(at(a))), (b, hash(at(b)))])).collect();
+    (pt, kept)
 }
 
 // sequential union-find: runs beside event parsing, so it is off the critical path
@@ -920,7 +990,7 @@ fn main() {
     });
     let camps: Map<u32> = campid.iter().enumerate().map(|(i, c)| (hash(c), i as u32)).collect();
     let ncamp = campid.len();
-    let cx = Ctx { ws, we, prod, unknown: catidx(b"unknown"), camps };
+    let mut cx = Ctx { ws, we, prod, unknown: catidx(b"unknown"), camps, uk: None, nb: 0 };
     lap("small tables");
 
     if std::env::var("TSCHECK").is_ok() {
@@ -1006,8 +1076,56 @@ fn main() {
         unsafe { libc::_exit(0) }
     }
     let (lf, ef, cf) = (csvs(&data.join("links")), csvs(&data.join("events")), csvs(&data.join("clicks")));
-    let lp = pairs(&lf);
     let ech = chunks(&ef);
+    // user key from the first lines of a spread of event chunks
+    if kn("DEC", 1) == 1 {
+        let mut us: Vec<&'static [u8]> = ech
+            .par_iter()
+            .step_by((ech.len() / 256).max(1))
+            .flat_map_iter(|&(d, h)| {
+                let mut v = vec![];
+                let e = d.len().min(16 << 10);
+                let e = d[..e].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
+                lines(&d[..e], h, |l| {
+                    let mut f: [&'static [u8]; 7] = [&[]; 7];
+                    if split(l, &mut f) && !f[1].is_empty() {
+                        v.push(f[1]);
+                    }
+                });
+                v
+            })
+            .collect();
+        us.sort_unstable();
+        let mut runs: Vec<(u32, &[u8])> = vec![];
+        for u in us {
+            match runs.last_mut() {
+                Some(r) if r.1 == u => r.0 += 1,
+                _ => runs.push((1, u)),
+            }
+        }
+        let distinct: Vec<&[u8]> = runs.iter().map(|r| r.1).collect();
+        runs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let freq: Vec<&[u8]> = runs.iter().take(16).map(|r| r.1).collect();
+        let bytes: usize = ef.iter().map(|d| d.len()).sum();
+        let vb = (bytes / 600).max(1 << 16) as u64; // persons, generously: 30 events of 75 B each per person
+        cx.uk = dec::user_key(&freq, &distinct, vb);
+        if let Some(k) = cx.uk {
+            let mx = distinct.iter().filter_map(|s| dec::id(s, b'u', k)).map(|n| n >> 9).filter(|&p| p < vb).max().unwrap_or(0);
+            cx.nb = (mx + mx / 4 + 1024).min(vb);
+        }
+        if std::env::var("DIAG").is_ok() {
+            eprintln!("DIAG sample {} distinct, user key {:?}, nb {}, vb {vb}", distinct.len(), cx.uk, cx.nb);
+        }
+    }
+    let (pt, lp) = match cx.uk {
+        Some(k) => links_fast(&lf, k, cx.nb),
+        None => (vec![], pairs(&lf)),
+    };
+    if std::env::var("DIAG").is_ok() {
+        eprintln!("DIAG persons {} complex {}, slow links {}", pt.len(), pt.iter().filter(|&&t| t == CPX).count(), lp.len());
+    }
+    lap("keys + links decoded");
+    let cx = cx;
     let ((pmap, names), s1) = rayon::join(
         || person_tab(lp),
         || {
@@ -1032,6 +1150,31 @@ fn main() {
     );
     lap("links + events parsed");
     let person = |u: u64| pmap.get(u).unwrap_or(u);
+    // fast person: (key, loc) where the loc is person << 9 | label with no length bits (real locs have some)
+    let fkey = |n: u64| -> Option<(u64, u64)> {
+        let t = pt[(n >> 9) as usize];
+        if t == CPX {
+            return None;
+        }
+        let a = n & 511;
+        let v = n & !511 | if a < 16 { t >> (4 * a) & 15 } else { a };
+        Some((mix(v), v))
+    };
+    let ukey = |s: &'static [u8]| -> u64 {
+        match cx.uk.and_then(|k| dec::id(s, b'u', k)).filter(|n| n >> 9 < cx.nb).and_then(fkey) {
+            Some((k, _)) => k,
+            None => person(hash(s)),
+        }
+    };
+    let ekey = |e: &Ev, ci: usize| -> (u64, u64) {
+        if e.uh & FAST != 0 {
+            if let Some(r) = fkey(e.uh & !FAST) {
+                return r;
+            }
+        }
+        let l = uloc(ech[ci].0, e.off);
+        (person(hash(at(l))), l)
+    };
 
     // 2: clicks by person; events deduped, then by person
     let (fc, fd) = (
@@ -1049,15 +1192,11 @@ fn main() {
                             return;
                         }
                         let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
-                        v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
+                        v.push(Cl { person: ukey(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
                     });
                     let mut cnt = vec![0u32; P];
-                    for i in 0..v.len() {
-                        if let Some(n) = v.get(i + PF) {
-                            pmap.prefetch(n.person);
-                        }
-                        v[i].person = person(v[i].person);
-                        cnt[(v[i].person >> (64 - PB)) as usize] += 1;
+                    for c in &v {
+                        cnt[(c.person >> (64 - PB)) as usize] += 1;
                     }
                     // exact sizes: whale persons would overflow fixed buckets into growing Vecs
                     let mut b = Bk::exact(&cnt);
@@ -1078,8 +1217,12 @@ fn main() {
                 .into_par_iter()
                 .map(|p| {
                     let mut h = vec![0u32; P];
-                    for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
-                        h[(person(e.uh) >> (64 - PB)) as usize] += 1;
+                    for (ci, c) in s1.iter().enumerate() {
+                        for e in c.get(p).into_iter().flatten() {
+                            if e.ts != BAD {
+                                h[(ekey(e, ci).0 >> (64 - PB)) as usize] += 1;
+                            }
+                        }
                     }
                     h
                 })
@@ -1139,24 +1282,23 @@ fn main() {
                             h = (h + 1) & (cap - 1);
                         }
                     }
-                    let user = |e: &Ev| e.uh;
-                    let mut ring = [0u64; PF]; // user hashes of the next PF rows, already prefetched
-                    for (r, e) in ring.iter_mut().zip(best.iter()) {
-                        *r = user(e);
-                        pmap.prefetch(*r);
-                    }
+                    let pf = |e: &Ev| {
+                        if e.uh & FAST != 0 {
+                            use std::arch::x86_64::*;
+                            unsafe { _mm_prefetch(pt.as_ptr().add(((e.uh & !FAST) >> 9) as usize) as *const i8, _MM_HINT_T0) }
+                        }
+                    };
+                    best.iter().take(PF).for_each(pf);
                     for i in 0..best.len() {
-                        let u = ring[i % PF];
                         if let Some(n) = best.get(i + PF) {
-                            ring[i % PF] = user(n);
-                            pmap.prefetch(ring[i % PF]);
+                            pf(n);
                         }
                         let e = &best[i];
                         if e.ts == BAD {
                             continue;
                         }
-                        let q = person(u);
-                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
+                        let (q, l) = ekey(e, bc[i] as usize);
+                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: l, ts: e.ts, pc: e.pc });
                     }
                     });
                     }
@@ -1194,11 +1336,33 @@ fn main() {
         stamp: u32,
         ev: Vec<Ev2>, // sort buffers, reused across partitions: no fresh pages to zero each time
         ck: Vec<Cl>,
+        nbuf: Vec<u8>, // fast names, in blocks that never move
     }
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
+    // a fast person's name: the smallest ID among the aliases sharing its label
+    let fname = |v: u64, buf: &mut Vec<u8>| -> u64 {
+        let (p, l, uk) = (v >> 9, v & 511, cx.uk.unwrap());
+        let t = pt[p as usize];
+        let (mut best, mut s) = (Vec::with_capacity(9), Vec::with_capacity(9));
+        for a in 0..16u64.max(l + 1) {
+            if a == l || (l < 16 && a < 16 && t >> (4 * a) & 15 == l) {
+                s.clear();
+                dec::enc(b'u', p << 9 | a, uk, &mut s);
+                if best.is_empty() || s < best {
+                    std::mem::swap(&mut best, &mut s);
+                }
+            }
+        }
+        if buf.capacity() - buf.len() < best.len() {
+            std::mem::forget(std::mem::replace(buf, Vec::with_capacity(1 << 16)));
+        }
+        let o = buf.len();
+        buf.extend_from_slice(&best);
+        loc(unsafe { std::slice::from_raw_parts(buf.as_ptr().add(o), best.len()) })
+    };
     let step = |mut st: St, q: usize| -> St {
             {
                 let (mut ev, mut ck) = (std::mem::take(&mut st.ev), std::mem::take(&mut st.ck));
@@ -1219,7 +1383,8 @@ fn main() {
                         ci += 1;
                     }
                     let pc = &ck[c0..ci];
-                    let name = *names.get(&pk).unwrap_or(&ev[i].loc);
+                    let l0 = ev[i].loc;
+                    let name = if l0 >> 48 == 0 { fname(l0, &mut st.nbuf) } else { *names.get(&pk).unwrap_or(&l0) };
                     let (mut lo, mut hi) = (0, 0);
                     let mut row: Option<URow> = None;
                     let mut cats: Vec<(u32, i64)> = vec![];
@@ -1299,7 +1464,7 @@ fn main() {
     let states: Vec<Vec<[i64; 4]>> = (0..32)
         .into_par_iter()
         .map(|k| {
-            let mut st = St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![] };
+            let mut st = St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![], nbuf: vec![] };
             for q in k * P / 32..(k + 1) * P / 32 {
                 st = step(st, q);
             }
