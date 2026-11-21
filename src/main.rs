@@ -1007,7 +1007,30 @@ fn main() {
     let lp = pairs(&lf);
     let ech = chunks(&ef);
     // 1: person table, then events parsed once: an R row by person and a thin D key by eid
-    let (pmap, names) = person_tab(lp);
+    // clicks are parsed while the (mostly serial) person table builds; their person scatter waits for it
+    let ((pmap, names), raw) = rayon::join(
+        || person_tab(lp),
+        || {
+            chunks(&cf)
+                .par_iter()
+                .map(|&(d, h)| {
+                    let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
+                    scan::<4>(d, h, |f| {
+                        if f[0].is_empty() || f[1].is_empty() {
+                            return;
+                        }
+                        let Some(ts) = parse_ts(f[3]) else { return };
+                        if ts < ws - WEEK || ts >= we {
+                            return;
+                        }
+                        let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
+                        v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
+                    });
+                    v
+                })
+                .collect::<Vec<_>>()
+        },
+    );
     let person = |u: u64| pmap.get(u).unwrap_or(u);
     lap("links");
     assert!(ech.len() < 4095, "too many chunks for 12-bit chunk ids");
@@ -1060,21 +1083,8 @@ fn main() {
 
     // 2: clicks by person; events deduped on the thin keys, losing copies' R rows marked KILL in place
     let fc = || {
-        chunks(&cf)
-            .par_iter()
-            .map(|&(d, h)| {
-                let mut v: Vec<Cl> = Vec::with_capacity(d.len() / 50);
-                scan::<4>(d, h, |f| {
-                    if f[0].is_empty() || f[1].is_empty() {
-                        return;
-                    }
-                    let Some(ts) = parse_ts(f[3]) else { return };
-                    if ts < ws - WEEK || ts >= we {
-                        return;
-                    }
-                    let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
-                    v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
-                });
+        raw.par_iter()
+            .map(|v| {
                 let mut b = Bk::new(v.len());
                 let mut w = Wc::new();
                 for i in 0..v.len() {
