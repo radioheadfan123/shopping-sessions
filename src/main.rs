@@ -1197,12 +1197,14 @@ fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], base_day: i64) {
          required int64 events; required int64 revenue_cents; optional binary top_category (STRING); }",
     );
     let mut rg = w.next_row_group().unwrap();
-    col!(rg, ByteArrayType, rows.iter().map(|r| ByteArray::from(at(r.name))).collect::<Vec<_>>(), None);
+    // zero-copy: names point into the input maps, which live until exit
+    col!(rg, ByteArrayType, rows.iter().map(|r| ByteArray::from(bytes::Bytes::from_static(at(r.name)))).collect::<Vec<_>>(), None);
     col!(rg, Int32Type, rows.iter().map(|r| (base_day + r.day as i64) as i32).collect::<Vec<_>>(), None);
     col!(rg, Int64Type, rows.iter().map(|r| r.sessions).collect::<Vec<_>>(), None);
     col!(rg, Int64Type, rows.iter().map(|r| r.events).collect::<Vec<_>>(), None);
     col!(rg, Int64Type, rows.iter().map(|r| r.revenue).collect::<Vec<_>>(), None);
-    let tops: Vec<ByteArray> = rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(cats[r.top as usize])).collect();
+    let cb: Vec<ByteArray> = cats.iter().map(|c| ByteArray::from(bytes::Bytes::copy_from_slice(c))).collect();
+    let tops: Vec<ByteArray> = rows.iter().filter(|r| r.top >= 0).map(|r| cb[r.top as usize].clone()).collect();
     let def: Vec<i16> = rows.iter().map(|r| (r.top >= 0) as i16).collect();
     col!(rg, ByteArrayType, tops, Some(&def[..]));
     rg.close().unwrap();
