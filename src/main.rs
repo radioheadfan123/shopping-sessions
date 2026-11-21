@@ -1583,6 +1583,8 @@ fn main() {
         // jobs split by estimated cost: low indices hold heavy persons, high ones many light persons
         let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len() + 16 * x.2; Some(*a) })).collect();
         let jb: Vec<usize> = (0..=32).map(|k| if k == 32 { P - 1 } else { cum.partition_point(|&c| c * 32 < k * cum[P - 1]) }).collect();
+        lap("job bounds");
+        let t32 = std::time::Instant::now();
         let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
             .into_par_iter()
             .map(|k| {
@@ -1647,7 +1649,7 @@ fn main() {
                     write_user(&ud.join(format!("part-{k}.parquet")), &st.rows, &catnames, base_day);
                 }
                 if std::env::var("PROF").is_ok() {
-                    eprintln!("  job {k} body {t1:.0} ms write {:.0} ms rows {}", tj.elapsed().as_secs_f64() * 1e3 - t1, st.rows.len());
+                    eprintln!("  job {k} body {t1:.0} ms write {:.0} ms rows {} start {:.0} thread {:?}", tj.elapsed().as_secs_f64() * 1e3 - t1, st.rows.len(), (tj - t32).as_secs_f64() * 1e3, rayon::current_thread_index());
                 }
                 (st.camp, slow)
             })
