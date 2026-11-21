@@ -207,7 +207,16 @@ fn at(l: u64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts((l & 0xffff_ffff_ffff) as *const u8, (l >> 48) as usize) }
 }
 
+/// Whole file read into anonymous memory (huge pages from the arena): no file-page faults or
+/// per-4K page table work on the input, which a VM pays for dearly.
 fn map(path: &Path) -> &'static [u8] {
+    if std::env::var("MMAP").is_ok() {
+        return map_file(path);
+    }
+    Box::leak(std::fs::read(path).unwrap().into_boxed_slice())
+}
+
+fn map_file(path: &Path) -> &'static [u8] {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).unwrap();
     let n = f.metadata().unwrap().len() as usize;
