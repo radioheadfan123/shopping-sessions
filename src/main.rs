@@ -814,6 +814,25 @@ fn main() {
         lap(&format!("links only: {} ids, {} names", pm.s.len() / 2, nm.len()));
         return;
     }
+    if let Ok(m) = std::env::var("PBENCH") {
+        let ch = chunks(&csvs(&data.join("events")));
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let c: u64 = ch.par_iter().map(|&(d, h)| {
+                let mut c = 0u64;
+                match m.as_str() {
+                    "lines" => lines(d, h, |l| c += l.len() as u64),
+                    "scan" => scan::<7>(d, h, |f| c += f[0].len() as u64),
+                    "hash" => scan::<7>(d, h, |f| c += hash(f[0]) ^ hash(f[1])),
+                    "ts" => scan::<7>(d, h, |f| c += parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64),
+                    _ => scan::<7>(d, h, |f| if let Some(e) = event(f, &cx) { c += e.eid ^ e.uh ^ e.pc as u64 }),
+                }
+                c
+            }).sum();
+            eprintln!("{m} {:.1} ms {c}", t.elapsed().as_secs_f64() * 1e3);
+        }
+        return;
+    }
     // 1: events by event_id partition, in parallel with links
     let lp = pairs(&csvs(&data.join("links")));
     let ((pmap, names), s1) = rayon::join(
