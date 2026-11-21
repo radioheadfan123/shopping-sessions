@@ -637,11 +637,11 @@ fn window(json: &str, key: &str) -> i64 {
 }
 
 /// P partitions of about n rows in total, in one block so the allocator can hand it out as huge,
-/// pre-faulted pages; a full partition spills into its own Vec.
+/// pre-faulted pages; a full partition spills into its own Vec. Partition b owns rows off[b]..off[b + 1].
 struct Bk<T> {
     v: Vec<T>,
     n: Vec<u32>,
-    cap: usize,
+    off: Vec<u32>,
     spill: Vec<Vec<T>>,
 }
 impl<T: Copy> Bk<T> {
@@ -651,20 +651,35 @@ impl<T: Copy> Bk<T> {
         if kn("FILL", 1) == 1 {
             cap = ((cap * P * sz).next_multiple_of(BIG) / (P * sz)) & !7; // the block is zeroed anyway: use it all
         }
-        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
+        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], off: (0..=P).map(|b| (b * cap) as u32).collect(), spill: (0..P).map(|_| vec![]).collect() }
+    }
+    /// Exactly cnt[b] rows per partition: nothing spills (whale persons overflowed fixed buckets) and no headroom is zeroed.
+    fn exact(cnt: &[u32]) -> Self {
+        let mut off = Vec::with_capacity(P + 1);
+        let mut a = 0u32;
+        off.push(0);
+        for &c in cnt {
+            a += c;
+            off.push(a);
+        }
+        Bk { v: Vec::with_capacity(a as usize), n: vec![0; P], off, spill: (0..P).map(|_| vec![]).collect() }
+    }
+    #[inline(always)]
+    fn cap(&self, b: usize) -> usize {
+        (self.off[b + 1] - self.off[b]) as usize
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
         let k = self.n[b] as usize;
-        if k < self.cap {
-            unsafe { self.v.as_mut_ptr().add(b * self.cap + k).write(x) };
+        if k < self.cap(b) {
+            unsafe { self.v.as_mut_ptr().add(self.off[b] as usize + k).write(x) };
             self.n[b] += 1;
         } else {
             self.spill[b].push(x);
         }
     }
     fn get(&self, b: usize) -> [&[T]; 2] {
-        [unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(b * self.cap), self.n[b] as usize) }, &self.spill[b]]
+        [unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(self.off[b] as usize), self.n[b] as usize) }, &self.spill[b]]
     }
     fn len(&self, b: usize) -> usize {
         self.n[b] as usize + self.spill[b].len()
@@ -690,10 +705,10 @@ impl<T: Copy + Default> Wc<T> {
         self.t[b] += 1;
         if t & 7 == 7 {
             let k = t - 7;
-            if k + 8 <= bk.cap {
+            if k + 8 <= bk.cap(b) {
                 unsafe {
                     use std::arch::x86_64::*;
-                    let d = bk.v.as_mut_ptr().add(b * bk.cap + k) as *mut __m128i;
+                    let d = bk.v.as_mut_ptr().add(bk.off[b] as usize + k) as *mut __m128i;
                     let s = self.buf[b].as_ptr() as *const __m128i;
                     if d as usize % 64 == 0 {
                         for i in 0..Self::L {
@@ -714,7 +729,7 @@ impl<T: Copy + Default> Wc<T> {
         for b in 0..P {
             let t = self.t[b] as usize;
             let (k, r) = (t & !7, t & 7);
-            if bk.n[b] as usize == k && k + r <= bk.cap {
+            if bk.n[b] as usize == k && k + r <= bk.cap(b) {
                 for e in &self.buf[b][..r] {
                     bk.push(b, *e);
                 }
@@ -1036,15 +1051,19 @@ fn main() {
                         let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
                         v.push(Cl { person: hash(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
                     });
-                    let mut b = Bk::new(v.len());
-                    let mut w = Wc::new();
+                    let mut cnt = vec![0u32; P];
                     for i in 0..v.len() {
                         if let Some(n) = v.get(i + PF) {
                             pmap.prefetch(n.person);
                         }
-                        let mut c = v[i];
-                        c.person = person(c.person);
-                        w.push(&mut b, (c.person >> (64 - PB)) as usize, c);
+                        v[i].person = person(v[i].person);
+                        cnt[(v[i].person >> (64 - PB)) as usize] += 1;
+                    }
+                    // exact sizes: whale persons would overflow fixed buckets into growing Vecs
+                    let mut b = Bk::exact(&cnt);
+                    let mut w = Wc::new();
+                    for c in &v {
+                        w.push(&mut b, (c.person >> (64 - PB)) as usize, *c);
                     }
                     w.finish(&mut b);
                     b
@@ -1057,8 +1076,8 @@ fn main() {
                 .into_par_iter()
                 .map(|k| {
                     let ps = k * P / 32..(k + 1) * P / 32;
-                    let mut b = Bk::new(ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum());
-                    let mut w = Wc::new();
+                    let n: usize = ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum();
+                    let (mut st, mut sb, mut cnt) = (Vec::with_capacity(n), Vec::with_capacity(n), vec![0u32; P]);
                     for p in ps {
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
@@ -1117,9 +1136,18 @@ fn main() {
                             continue;
                         }
                         let q = person(u);
-                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
+                        let pb = (q >> (64 - PB)) as usize;
+                        cnt[pb] += 1;
+                        st.push(Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
+                        sb.push(pb as u16);
                     }
                     });
+                    }
+                    // staged, then placed at exact sizes: whale persons would overflow fixed buckets
+                    let mut b = Bk::exact(&cnt);
+                    let mut w = Wc::new();
+                    for (e, &pb) in st.iter().zip(&sb) {
+                        w.push(&mut b, pb as usize, *e);
                     }
                     w.finish(&mut b);
                     b
@@ -1135,6 +1163,12 @@ fn main() {
         rayon::join(fc, fd)
     };
     lap("clicks parsed, events deduped");
+    if std::env::var("SPILL").is_ok() {
+        for (nm, v) in [("s2", s2.iter().map(|b| (b.n.iter().map(|&x| x as usize).sum::<usize>(), b.spill.iter().map(|x| x.len()).sum::<usize>())).collect::<Vec<_>>()), ("cl", cl.iter().map(|b| (b.n.iter().map(|&x| x as usize).sum::<usize>(), b.spill.iter().map(|x| x.len()).sum::<usize>())).collect())] {
+            let (i, o) = v.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            eprintln!("SPILL {nm} {i} in buckets, {o} spilled");
+        }
+    }
     drop(s1);
     lap("s1 dropped");
 
