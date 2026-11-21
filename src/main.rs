@@ -858,6 +858,7 @@ fn main() {
     }
     let states: Vec<St> = (0..P)
         .into_par_iter()
+        .with_min_len(P / 32) // at most 32 states (fold made about 220, each with its own campaign array and part file)
         .fold(
             || St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![] },
             |mut st, q| {
