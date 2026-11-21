@@ -689,7 +689,7 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
     let t = std::time::Instant::now();
     let pr = |w: &str| if std::env::var("PROF").is_ok() { eprintln!("  persons {w} {:.1} ms", t.elapsed().as_secs_f64() * 1e3) };
     let mut idx = Tab::new(pairs.len() * 2); // id hash -> index
-    let (mut parent, mut ids): (Vec<u32>, Vec<(u64, u64)>) = (vec![], vec![]);
+    let (mut parent, mut ids, mut mn): (Vec<u32>, Vec<(u64, u64)>, Vec<u32>) = (vec![], vec![], vec![]); // mn: root -> id with the smallest name
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
             p[x as usize] = p[p[x as usize] as usize];
@@ -708,6 +708,7 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
                 let i = ids.len() as u32;
                 idx.insert(h, i as u64);
                 parent.push(i);
+                mn.push(i);
                 ids.push((l, h));
                 i
             }
@@ -715,19 +716,16 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
         let (a, b) = (id(pr[0]), id(pr[1]));
         let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
         if ra != rb {
-            parent[ra.max(rb) as usize] = ra.min(rb);
+            let (lo, hi) = (ra.min(rb) as usize, ra.max(rb) as usize);
+            parent[hi] = lo as u32;
+            if at(ids[mn[hi] as usize].0) < at(ids[mn[lo] as usize].0) {
+                mn[lo] = mn[hi];
+            }
         }
     }
     pr("union");
     let n = ids.len();
-    let mut best = vec![u32::MAX; n];
-    for x in 0..n as u32 {
-        let r = find(&mut parent, x) as usize;
-        if best[r] == u32::MAX || at(ids[x as usize].0) < at(ids[best[r] as usize].0) {
-            best[r] = x;
-        }
-    }
-    pr("best");
+    let best = mn;
     let mut pmap = Tab::new(n);
     let mut names: Map<u64> = Map::with_capacity_and_hasher(n / 2, Default::default());
     for x in 0..n {
