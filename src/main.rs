@@ -320,7 +320,7 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
     assert!(d.len() < u32::MAX as usize - 128);
     let mut e: Vec<(u32, u32)> = Vec::with_capacity(W + 128); // (offset, quotes before it)
     let (mut qtot, mut skip, mut base, mut ls, mut lq) = (0u32, header, 0usize, 0usize, 0u32);
-    let nl = |p: u32| d.get(p as usize).is_none_or(|&c| c == b'\n'); // past the end = the last line's break
+    const NL: u32 = 1 << 31; // set on the quote count of a '\n' entry, so stage 2 never rereads d
     while base < d.len() {
         let stop = (base + W).min(d.len());
         e.reserve(stop - base + 128);
@@ -341,7 +341,8 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
             loop {
                 for _ in 0..8 {
                     let below = b.wrapping_sub(1) & !b;
-                    unsafe { ep.add(n + u).write(((base as u32).wrapping_add(b.trailing_zeros()), qtot + (qm & below).count_ones())) };
+                    let tz = b.trailing_zeros();
+                    unsafe { ep.add(n + u).write(((base as u32).wrapping_add(tz), (qtot + (qm & below).count_ones()) | ((nm >> (tz & 63)) as u32) << 31)) };
                     b &= b.wrapping_sub(1);
                     u += 1;
                 }
@@ -354,17 +355,18 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
             base += 64;
         }
         if base == d.len() && d[d.len() - 1] != b'\n' {
-            unsafe { ep.add(n).write((d.len() as u32, qtot)) }; // no break after the last line, and no tail block to add one
+            unsafe { ep.add(n).write((d.len() as u32, qtot | NL)) }; // no break after the last line, and no tail block to add one
             n += 1;
         }
         unsafe { e.set_len(n) };
         let mut k = 0;
         while k < e.len() {
-            let Some(j) = e[k..].iter().position(|x| nl(x.0)) else { break }; // line goes on in the next window
+            let Some(j) = e[k..].iter().position(|x| x.1 & NL != 0) else { break }; // line goes on in the next window
             if j == N - 1 && !skip {
                 let mut fl: [&'static [u8]; N] = [&[]; N];
                 let (mut s, mut q0, mut good) = (ls, lq, true);
                 for (j, &(p, q)) in e[k..k + N].iter().enumerate() {
+                    let q = q & !NL;
                     let x = unsafe { d.get_unchecked(s..(p as usize).min(d.len())) };
                     let w = q - q0 == 2 && x.len() >= 2 && x[0] == b'"' && x[x.len() - 1] == b'"';
                     good &= q == q0 || w;
@@ -376,7 +378,7 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
                 }
             }
             skip = false;
-            (ls, lq) = (e[k + j].0 as usize + 1, e[k + j].1);
+            (ls, lq) = (e[k + j].0 as usize + 1, e[k + j].1 & !NL);
             k += j + 1;
         }
         e.drain(..k);
