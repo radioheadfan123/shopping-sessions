@@ -1265,7 +1265,7 @@ fn main() {
                     if let Some(sl) = &slots {
                         // rows are in random index order: prefetch each slot and put it RING rows later,
                         // in order (first seen within the chunk keeps ties)
-                        const RING: usize = 16;
+                        const RING: usize = 32;
                         let (mut odd, mut ring, mut n) = (vec![], [Ev::default(); RING], 0usize);
                         scan::<7>(d, h, |f| {
                             if let Some((p, e)) = event(f, &cx, d.as_ptr()) {
