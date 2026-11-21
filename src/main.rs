@@ -1017,6 +1017,7 @@ fn main() {
     );
     lap("links + events parsed");
     let person = |u: u64| pmap.get(u).unwrap_or(u);
+    let (nop1, nop2) = (kn("NOP", 0) & 1 == 1, kn("NOP", 0) & 2 == 2);
 
     // 2: clicks by person; events deduped, then by person
     let (fc, fd) = (
@@ -1080,6 +1081,7 @@ fn main() {
                             use std::arch::x86_64::*;
                             unsafe { _mm_prefetch(tab.as_ptr().add(a.eid as usize & (cap - 1)) as *const i8, _MM_HINT_T0) }
                         }
+                        if nop2 { best.push(*e); bc.push(ci); continue; }
                         let (tag, mut h) = (((e.eid >> (64 - PB - 32)) as u32) & !rmask, e.eid as usize & (cap - 1));
                         loop {
                             let t = tab[h];
@@ -1116,7 +1118,7 @@ fn main() {
                         if e.ts == BAD {
                             continue;
                         }
-                        let q = person(u);
+                        let q = if nop1 { u } else { person(u) };
                         w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
                     }
                     });
