@@ -62,7 +62,8 @@ static GA: Big = Big;
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
-const P: usize = 256; // partitions, picked by the top 8 bits of a hash
+const PB: u32 = 10; // partition bits
+const P: usize = 1 << PB; // partitions, picked by the top PB bits of a hash
 const BAD: u32 = u32::MAX;
 const CHUNK: usize = 8 << 20;
 
@@ -555,7 +556,7 @@ impl<T: Copy> Bk<T> {
 #[inline(always)]
 fn parse_event(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut Bk<Ev>) {
     if let Some(e) = event(f, cx) {
-        out.push((e.eid >> 56) as usize, e);
+        out.push((e.eid >> (64 - PB)) as usize, e);
     }
 }
 
@@ -768,7 +769,7 @@ fn main() {
                         }
                         let mut c = v[i];
                         c.person = person(c.person);
-                        b.push((c.person >> 56) as usize, c);
+                        b.push((c.person >> (64 - PB)) as usize, c);
                     }
                     b
                 })
@@ -827,7 +828,7 @@ fn main() {
                             continue;
                         }
                         let q = person(u);
-                        b.push((q >> 56) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
+                        b.push((q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
                     }
                     b
                 }))
@@ -1001,7 +1002,7 @@ fn main() {
 fn group<T: Copy>(src: &[Bk<T>], q: usize, key: impl Fn(&T) -> (u64, u32), out: &mut Vec<T>) {
     let n: usize = src.iter().map(|c| c.len(q)).sum();
     let bits = (usize::BITS - (n / 8).leading_zeros()).clamp(1, 16);
-    let b = |x: &T| (key(x).0 >> (56 - bits)) as usize & ((1 << bits) - 1);
+    let b = |x: &T| (key(x).0 >> (64 - PB - bits)) as usize & ((1 << bits) - 1);
     let mut at = vec![0u32; (1 << bits) + 1];
     for x in src.iter().flat_map(|c| c.get(q)).flatten() {
         at[b(x) + 1] += 1;
