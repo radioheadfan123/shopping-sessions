@@ -156,6 +156,8 @@ thread_local! {
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
     static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<D>)> = Default::default();
     static WC2: std::cell::RefCell<Option<(Wc<R>, Wc<D>)>> = const { std::cell::RefCell::new(None) };
+    /// phase 1 person rows staged per chunk (row, partition) plus counts, so the chunk's R buckets are sized exactly
+    static RS: std::cell::RefCell<(Vec<R>, Vec<u16>, Vec<u32>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 #[inline(always)]
@@ -650,11 +652,11 @@ fn window(json: &str, key: &str) -> i64 {
 }
 
 /// P partitions of about n rows in total, in one block so the allocator can hand it out as huge,
-/// pre-faulted pages; a full partition spills into its own Vec.
+/// pre-faulted pages; a full partition spills into its own Vec. Partition b owns rows off[b]..off[b + 1].
 struct Bk<T> {
     v: Vec<T>,
     n: Vec<u32>,
-    cap: usize,
+    off: Vec<u32>,
     spill: Vec<Vec<T>>,
 }
 impl<T: Copy> Bk<T> {
@@ -664,20 +666,35 @@ impl<T: Copy> Bk<T> {
         if kn("FILL", 1) == 1 {
             cap = ((cap * P * sz).next_multiple_of(BIG) / (P * sz)) & !7; // the block is zeroed anyway: use it all
         }
-        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
+        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], off: (0..=P).map(|b| (b * cap) as u32).collect(), spill: (0..P).map(|_| vec![]).collect() }
+    }
+    /// Exactly cnt[b] rows per partition: nothing spills (whale persons overflowed fixed buckets) and no headroom is zeroed.
+    fn exact(cnt: &[u32]) -> Self {
+        let mut off = Vec::with_capacity(P + 1);
+        let mut a = 0u32;
+        off.push(0);
+        for &c in cnt {
+            a += c;
+            off.push(a);
+        }
+        Bk { v: Vec::with_capacity(a as usize), n: vec![0; P], off, spill: (0..P).map(|_| vec![]).collect() }
+    }
+    #[inline(always)]
+    fn cap(&self, b: usize) -> usize {
+        (self.off[b + 1] - self.off[b]) as usize
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
         let k = self.n[b] as usize;
-        if k < self.cap {
-            unsafe { self.v.as_mut_ptr().add(b * self.cap + k).write(x) };
+        if k < self.cap(b) {
+            unsafe { self.v.as_mut_ptr().add(self.off[b] as usize + k).write(x) };
             self.n[b] += 1;
         } else {
             self.spill[b].push(x);
         }
     }
     fn get(&self, b: usize) -> [&[T]; 2] {
-        [unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(b * self.cap), self.n[b] as usize) }, &self.spill[b]]
+        [unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(self.off[b] as usize), self.n[b] as usize) }, &self.spill[b]]
     }
     fn len(&self, b: usize) -> usize {
         self.n[b] as usize + self.spill[b].len()
@@ -703,10 +720,10 @@ impl<T: Copy + Default> Wc<T> {
         self.t[b] += 1;
         if t & 7 == 7 {
             let k = t - 7;
-            if k + 8 <= bk.cap {
+            if k + 8 <= bk.cap(b) {
                 unsafe {
                     use std::arch::x86_64::*;
-                    let d = bk.v.as_mut_ptr().add(b * bk.cap + k) as *mut __m128i;
+                    let d = bk.v.as_mut_ptr().add(bk.off[b] as usize + k) as *mut __m128i;
                     let s = self.buf[b].as_ptr() as *const __m128i;
                     if d as usize % 64 == 0 {
                         for i in 0..Self::L {
@@ -727,7 +744,7 @@ impl<T: Copy + Default> Wc<T> {
         for b in 0..P {
             let t = self.t[b] as usize;
             let (k, r) = (t & !7, t & 7);
-            if bk.n[b] as usize == k && k + r <= bk.cap {
+            if bk.n[b] as usize == k && k + r <= bk.cap(b) {
                 for e in &self.buf[b][..r] {
                     bk.push(b, *e);
                 }
@@ -1039,20 +1056,27 @@ fn main() {
         .enumerate()
         .map(|(ci, &(d, h))| {
             assert!(d.len() < 1 << 24, "chunk too long for 24-bit user_id offsets");
-            let (mut br, mut bd) = (Bk::new(d.len() / 70), Bk::new(d.len() / 70));
-            WC2.with_borrow_mut(|w| {
+            let mut bd = Bk::new(d.len() / 70);
+            let mut br = Bk::new(0);
+            WC2.with_borrow_mut(|w| RS.with_borrow_mut(|(rs, rb, cnt)| {
                 let (wr, wd) = w.get_or_insert_with(|| (Wc::new(), Wc::new()));
                 wr.t.fill(0);
                 wd.t.fill(0);
-                let fin = |e: &Ev, wr: &mut Wc<R>, wd: &mut Wc<D>, br: &mut Bk<R>, bd: &mut Bk<D>| {
+                rs.clear();
+                rb.clear();
+                cnt.clear();
+                cnt.resize(P, 0);
+                let fin = |e: &Ev, wd: &mut Wc<D>, bd: &mut Bk<D>, rs: &mut Vec<R>, rb: &mut Vec<u16>, cnt: &mut Vec<u32>| {
                     let (mut at, mut pp) = (u32::MAX, 0u64);
                     if e.ts != BAD {
                         let q = person(e.uh);
                         let b = (q >> (64 - PB)) as usize;
-                        let t = wr.t[b];
+                        let t = cnt[b];
                         assert!(t < 1 << 20, "partition too big for 20-bit row ids");
+                        cnt[b] += 1;
                         (at, pp) = ((ci as u32) << 20 | t, b as u64);
-                        wr.push(br, b, R { person: q, ts: e.ts, pc: e.pc, ci: ci as u32, off: e.off });
+                        rs.push(R { person: q, ts: e.ts, pc: e.pc, ci: ci as u32, off: e.off });
+                        rb.push(b as u16);
                     }
                     wd.push(bd, (e.eid >> (64 - PB)) as usize, D { eid: e.eid & LOW | pp << (64 - PB), ingest: e.ingest, at });
                 };
@@ -1065,21 +1089,36 @@ fn main() {
                         }
                         let old = std::mem::replace(&mut ring[k % PF], e);
                         if k >= PF {
-                            fin(&old, wr, wd, &mut br, &mut bd);
+                            fin(&old, wd, &mut bd, rs, rb, cnt);
                         }
                         k += 1;
                     }
                 });
                 for i in k.saturating_sub(PF)..k {
-                    fin(&ring[i % PF], wr, wd, &mut br, &mut bd);
+                    fin(&ring[i % PF], wd, &mut bd, rs, rb, cnt);
+                }
+                wd.finish(&mut bd);
+                // rows land in arrival order per partition, so each row's index is the t its D key already holds
+                br = Bk::exact(cnt);
+                for (r, &b) in rs.iter().zip(rb.iter()) {
+                    wr.push(&mut br, b as usize, *r);
                 }
                 wr.finish(&mut br);
-                wd.finish(&mut bd);
-            });
+            }));
             (br, bd)
         })
         .collect();
     lap("links + events parsed");
+    if std::env::var("SPILL").is_ok() {
+        let (mut rn, mut rs, mut dn, mut ds, mut rmax) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for (br, bd) in &s1 {
+            for b in 0..P {
+                rn += br.n[b] as usize; rs += br.spill[b].len(); dn += bd.n[b] as usize; ds += bd.spill[b].len();
+                rmax = rmax.max(br.len(b));
+            }
+        }
+        eprintln!("SPILL R {rn} in buckets, {rs} spilled; D {dn} in buckets, {ds} spilled; R max bucket {rmax}");
+    }
 
     // 2: clicks by person; events deduped on the thin keys, losing copies' R rows marked KILL in place
     let fc = || {
