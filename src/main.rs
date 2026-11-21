@@ -28,6 +28,25 @@ unsafe impl std::alloc::GlobalAlloc for Big {
                 return p as *mut u8;
             }
         }
+        // carved from one reserved arena: a mmap/munmap/madvise per block takes the mmap write lock,
+        // which stalls every other thread's populate and page faults (8 threads ran no faster than 4)
+        let base = *ARENA.get_or_init(|| unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), ARENA_SZ + BIG, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+            if p == libc::MAP_FAILED {
+                return 0;
+            }
+            let a = (p as usize).next_multiple_of(BIG);
+            libc::madvise(a as *mut libc::c_void, ARENA_SZ, libc::MADV_HUGEPAGE);
+            a
+        });
+        if base != 0 {
+            let off = BUMP.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            if off + n <= ARENA_SZ {
+                let a = base + off;
+                unsafe { libc::madvise(a as *mut libc::c_void, n, 23) }; // MADV_POPULATE_WRITE (Linux 5.14+); a no-op error before that
+                return a as *mut u8;
+            }
+        }
         unsafe {
             let p = libc::mmap(std::ptr::null_mut(), n + BIG, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
             if p == libc::MAP_FAILED {
@@ -56,6 +75,10 @@ unsafe impl std::alloc::GlobalAlloc for Big {
 /// Freed big blocks (address, bytes). ponytail: no coalescing of neighbours; add it if a big
 /// request ever misses a pool that holds enough adjacent bytes.
 static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Reserved address space only (NORESERVE); pages are committed as blocks are handed out.
+const ARENA_SZ: usize = 64 << 30;
+static ARENA: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static BUMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[global_allocator]
 static GA: Big = Big;
 
