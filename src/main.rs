@@ -577,20 +577,23 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
 
 /// Links -> (id hash -> person key, person key -> name loc). Person key = hash of the person's name.
 fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
-    let pairs: Vec<(u64, u64)> = chunks(files)
+    // (loc, hash) of both sides, hashed in the parallel pass
+    let pairs: Vec<[(u64, u64); 2]> = chunks(files)
         .par_iter()
         .flat_map_iter(|&(d, h)| {
             let mut v = vec![];
             scan::<2>(d, h, |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((loc(f[0]), loc(f[1])));
+                    v.push([(loc(f[0]), hash(f[0])), (loc(f[1]), hash(f[1]))]);
                 }
             });
             v
         })
         .collect();
-    let mut idx: Map<u32> = Map::with_capacity_and_hasher(pairs.len() * 2, Default::default());
-    let (mut parent, mut locs): (Vec<u32>, Vec<u64>) = (vec![], vec![]);
+    let t = std::time::Instant::now();
+    let pr = |w: &str| if std::env::var("PROF").is_ok() { eprintln!("  persons {w} {:.1} ms", t.elapsed().as_secs_f64() * 1e3) };
+    let mut idx = Tab::new(pairs.len() * 2); // id hash -> index
+    let (mut parent, mut ids): (Vec<u32>, Vec<(u64, u64)>) = (vec![], vec![]);
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
             p[x as usize] = p[p[x as usize] as usize];
@@ -598,36 +601,44 @@ fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
         }
         x
     }
-    for &(a, b) in &pairs {
-        let mut id = |l: u64| {
-            *idx.entry(hash(at(l))).or_insert_with(|| {
-                parent.push(locs.len() as u32);
-                locs.push(l);
-                locs.len() as u32 - 1
-            })
+    for pr in &pairs {
+        let mut id = |(l, h): (u64, u64)| match idx.get(h) {
+            Some(i) => i as u32,
+            None => {
+                let i = ids.len() as u32;
+                idx.insert(h, i as u64);
+                parent.push(i);
+                ids.push((l, h));
+                i
+            }
         };
-        let (a, b) = (id(a), id(b));
+        let (a, b) = (id(pr[0]), id(pr[1]));
         let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
         if ra != rb {
             parent[ra.max(rb) as usize] = ra.min(rb);
         }
     }
-    let n = locs.len();
+    pr("union");
+    let n = ids.len();
     let mut best = vec![u32::MAX; n];
     for x in 0..n as u32 {
         let r = find(&mut parent, x) as usize;
-        if best[r] == u32::MAX || at(locs[x as usize]) < at(locs[best[r] as usize]) {
+        if best[r] == u32::MAX || at(ids[x as usize].0) < at(ids[best[r] as usize].0) {
             best[r] = x;
         }
     }
+    pr("best");
     let mut pmap = Tab::new(n);
-    let mut names: Map<u64> = Map::default();
+    let mut names: Map<u64> = Map::with_capacity_and_hasher(n / 2, Default::default());
     for x in 0..n {
-        let name = locs[best[find(&mut parent, x as u32) as usize] as usize];
-        let key = hash(at(name));
-        pmap.insert(hash(at(locs[x])), key);
-        names.insert(key, name);
+        let r = find(&mut parent, x as u32) as usize;
+        let (name, key) = ids[best[r] as usize];
+        pmap.insert(ids[x].1, key);
+        if r == x {
+            names.insert(key, name);
+        }
     }
+    pr("maps");
     (pmap, names)
 }
 
@@ -688,6 +699,11 @@ fn main() {
             assert_eq!(parse_ts(t.as_bytes()), w, "{t}");
         }
         eprintln!("ts ok");
+        return;
+    }
+    if std::env::var("LINKS").is_ok() {
+        let (pm, nm) = persons(&csvs(&data.join("links")));
+        lap(&format!("links only: {} ids, {} names", pm.s.len() / 2, nm.len()));
         return;
     }
     // 1: events by event_id partition, in parallel with links
