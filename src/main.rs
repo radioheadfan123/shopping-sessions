@@ -615,8 +615,12 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
 
 /// Links -> (id hash -> person key, person key -> name loc). Person key = hash of the person's name.
 fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
-    // (loc, hash) of both sides, hashed in the parallel pass
-    let pairs: Vec<[(u64, u64); 2]> = chunks(files)
+    person_tab(pairs(files))
+}
+
+// (loc, hash) of both sides, hashed in the parallel pass
+fn pairs(files: &[&'static [u8]]) -> Vec<[(u64, u64); 2]> {
+    chunks(files)
         .par_iter()
         .flat_map_iter(|&(d, h)| {
             let mut v = vec![];
@@ -627,7 +631,11 @@ fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
             });
             v
         })
-        .collect();
+        .collect()
+}
+
+// sequential union-find: runs beside event parsing, so it is off the critical path
+fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
     let t = std::time::Instant::now();
     let pr = |w: &str| if std::env::var("PROF").is_ok() { eprintln!("  persons {w} {:.1} ms", t.elapsed().as_secs_f64() * 1e3) };
     let mut idx = Tab::new(pairs.len() * 2); // id hash -> index
@@ -750,8 +758,9 @@ fn main() {
         return;
     }
     // 1: events by event_id partition, in parallel with links
+    let lp = pairs(&csvs(&data.join("links")));
     let ((pmap, names), s1) = rayon::join(
-        || persons(&csvs(&data.join("links"))),
+        || person_tab(lp),
         || {
             chunks(&csvs(&data.join("events")))
                 .par_iter()
