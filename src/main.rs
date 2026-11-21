@@ -1596,7 +1596,30 @@ fn main() {
         let slt = slots.as_ref().unwrap();
         // index range of partition j < P - 1
         let rng = |j: usize| (j as u64 * cx.ew).min(cx.eb)..if j == P - 2 { cx.eb } else { ((j as u64 + 1) * cx.ew).min(cx.eb) };
-        let (cl, pa) = seqjoin(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
+        // the clicks side also groups its clicks, alongside the dedup walk
+        let ((_cl, _cbuf, cs), pa) = seqjoin(|| {
+            let cl = fc();
+            lap("  (clicks parse done)");
+            // clicks by partition, in one big buffer: each partition fills and sorts its exact slice
+            let co: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, q| { *a += cl.iter().map(|c| c.len(q)).sum::<usize>(); Some(*a) })).collect();
+            let mut cbuf: Vec<Cl> = Vec::with_capacity(co[P]);
+            let cb = cbuf.as_mut_ptr() as usize;
+            let cs: Vec<&'static [Cl]> = (0..P)
+                .into_par_iter()
+                .map(|q| {
+                    // not group(): its radix step assumes keys share their top bits, and person-number partitions do not
+                    // (the slices live in cbuf's heap block, which is returned with them and outlives every use)
+                    let v = unsafe { std::slice::from_raw_parts_mut((cb as *mut Cl).add(co[q]), co[q + 1] - co[q]) };
+                    for (d, s) in v.iter_mut().zip(cl.iter().flat_map(|c| c.get(q)).flatten()) {
+                        *d = *s;
+                    }
+                    v.sort_unstable_by_key(|c| (c.person, c.ts));
+                    &*v
+                })
+                .collect();
+            lap("  (clicks grouped)");
+            (cl, cbuf, cs) // cl too: freeing it here would munmap mid-walk
+        }, || {
             let r = (0..P)
                 .into_par_iter()
                 .map(|j| {
@@ -1680,22 +1703,6 @@ fn main() {
         });
         lap("clicks parsed, events deduped by index");
         drop(s1);
-        // clicks by partition, in one big buffer: each partition fills and sorts its exact slice
-        let co: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, q| { *a += cl.iter().map(|c| c.len(q)).sum::<usize>(); Some(*a) })).collect();
-        let mut cbuf: Vec<Cl> = Vec::with_capacity(co[P]);
-        let cb = cbuf.as_mut_ptr() as usize;
-        let cs: Vec<&[Cl]> = (0..P)
-            .into_par_iter()
-            .map(|q| {
-                // not group(): its radix step assumes keys share their top bits, and person-number partitions do not
-                let v = unsafe { std::slice::from_raw_parts_mut((cb as *mut Cl).add(co[q]), co[q + 1] - co[q]) };
-                for (d, s) in v.iter_mut().zip(cl.iter().flat_map(|c| c.get(q)).flatten()) {
-                    *d = *s;
-                }
-                v.sort_unstable_by_key(|c| (c.person, c.ts));
-                &*v
-            })
-            .collect();
         let clk = |key: u64| -> &[Cl] {
             let c = &cs[cq(key)];
             let a = c.partition_point(|x| x.person < key);
