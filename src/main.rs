@@ -859,6 +859,40 @@ fn main() {
         return;
     }
     // 1: events by event_id partition, in parallel with links
+    if let Ok(m) = std::env::var("ONLY") {
+        // diag: 1 = scan only, 2 = scan + event(), 3 = full phase 1 without persons
+        let ech = chunks(&csvs(&data.join("events")));
+        lap("mapped");
+        let m: u32 = m.parse().unwrap();
+        let tot: u64 = ech
+            .par_iter()
+            .map(|&(d, h)| {
+                let mut x = 0u64;
+                if m == 1 {
+                    scan::<7>(d, h, |f| x = x.wrapping_add(f[0].len() as u64 ^ f[3].len() as u64));
+                } else if m == 2 {
+                    scan::<7>(d, h, |f| if let Some(e) = event(f, &cx, d.as_ptr()) { x = x.wrapping_add(e.eid ^ e.uh ^ e.ts as u64 ^ e.pc as u64) });
+                } else {
+                    let mut b = Bk::new(d.len() / 70);
+                    WC.with_borrow_mut(|w| {
+                        let w = w.get_or_insert_with(Wc::new);
+                        w.t.fill(0);
+                        scan::<7>(d, h, |f| {
+                            if let Some(e) = event(f, &cx, d.as_ptr()) {
+                                w.push(&mut b, (e.eid >> (64 - PB)) as usize, e);
+                            }
+                        });
+                        w.finish(&mut b);
+                    });
+                    x = b.n.iter().map(|&n| n as u64).sum();
+                    std::mem::forget(b);
+                }
+                x
+            })
+            .sum();
+        lap(&format!("ONLY={m} done {tot}"));
+        unsafe { libc::_exit(0) }
+    }
     let lp = pairs(&csvs(&data.join("links")));
     let ech = chunks(&csvs(&data.join("events")));
     let ((pmap, names), s1) = rayon::join(
