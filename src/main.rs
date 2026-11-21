@@ -776,9 +776,14 @@ fn main() {
                 .collect::<Vec<_>>()
         },
         || {
-            (0..P)
+            // 32 jobs of P / 32 partitions, each filling one output: one bucket set per job, not per partition
+            (0..32)
                 .into_par_iter()
-                .map(|p| SCRATCH.with_borrow_mut(|(tab, best)| {
+                .map(|k| {
+                    let ps = k * P / 32..(k + 1) * P / 32;
+                    let mut b = Bk::new(ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum());
+                    for p in ps {
+                    SCRATCH.with_borrow_mut(|(tab, best)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
                     let cap = (n * 2).next_power_of_two().max(16);
                     // reused per thread: no fresh mmap, page faults and munmap for every partition
@@ -810,7 +815,6 @@ fn main() {
                             h = (h + 1) & (cap - 1);
                         }
                     }
-                    let mut b = Bk::new(best.len());
                     let user = |e: &Ev| e.uh;
                     let mut ring = [0u64; PF]; // user hashes of the next PF rows, already prefetched
                     for (r, e) in ring.iter_mut().zip(best.iter()) {
@@ -830,8 +834,10 @@ fn main() {
                         let q = person(u);
                         b.push((q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
                     }
+                    });
+                    }
                     b
-                }))
+                })
                 .collect::<Vec<_>>()
         },
     );
