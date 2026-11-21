@@ -1470,8 +1470,8 @@ fn main() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         let rc: Vec<AtomicU32> = (0..cx.nb).into_par_iter().map(|_| AtomicU32::new(0)).collect();
         let fastv = |e: &Ev| if e.uh & FAST != 0 { fkey(e.uh & !FAST).map(|r| r.1) } else { None };
-        let (cl, pa) = rayon::join(fc, || {
-            (0..P)
+        let (cl, pa) = rayon::join(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
+            let r = (0..P)
                 .into_par_iter()
                 .map(|j| {
                     let (mut fv, mut sl, mut nr) = (vec![], vec![], 0usize); // fast survivors (index order), slow ones, runs
@@ -1552,7 +1552,9 @@ fn main() {
                     });
                     (fv, sl, nr)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            lap("  (dedup done)");
+            r
         });
         lap("clicks parsed, events deduped by index");
         drop(s1);
