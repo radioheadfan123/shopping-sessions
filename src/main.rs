@@ -644,7 +644,7 @@ struct Ctx {
     nb: u64,         // persons below this decode fast
     ek: Option<u64>, // event key, if recovered: events then go to partitions by index
     eb: u64,         // event indices below this decode fast
-    es: u32,         // index partition = index >> es
+    ew: u64,         // index partition = index / ew (the last index partition also takes the rest)
 }
 
 fn window(json: &str, key: &str) -> i64 {
@@ -766,7 +766,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx, base: *const u8) -> Option<(usize, Ev
     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
     // partition: by event index if it decodes (index < eb), else by hash; with a key, every odd ID goes to P - 1
     let (eid, b) = match cx.ek.and_then(|k| dec::id(f[0], b'e', k)).filter(|&i| i < cx.eb) {
-        Some(i) => (i, (i >> cx.es) as usize),
+        Some(i) => (i, ((i / cx.ew) as usize).min(P - 2)),
         None => {
             let h = hash(f[0]);
             (h, if cx.ek.is_some() { P - 1 } else { (h >> (64 - PB)) as usize })
@@ -1000,7 +1000,7 @@ fn main() {
     });
     let camps: Map<u32> = campid.iter().enumerate().map(|(i, c)| (hash(c), i as u32)).collect();
     let ncamp = campid.len();
-    let mut cx = Ctx { ws, we, prod, unknown: catidx(b"unknown"), camps, uk: None, nb: 0, ek: None, eb: 0, es: 0 };
+    let mut cx = Ctx { ws, we, prod, unknown: catidx(b"unknown"), camps, uk: None, nb: 0, ek: None, eb: 0, ew: 1 };
     lap("small tables");
 
     if std::env::var("TSCHECK").is_ok() {
@@ -1136,11 +1136,11 @@ fn main() {
             if let Some(ek) = cx.ek {
                 let mx = eids.iter().filter_map(|s| dec::id(s, b'e', ek)).filter(|&i| i < ebv).max().unwrap_or(0);
                 cx.eb = (mx + mx / 4 + 4096).min(ebv);
-                cx.es = (0..41).find(|&s| (cx.eb - 1) >> s <= (P - 2) as u64).unwrap();
+                cx.ew = (mx + mx / 64 + 1).div_ceil((P - 1) as u64).max(1); // fill every index partition
             }
         }
         if std::env::var("DIAG").is_ok() {
-            eprintln!("DIAG sample {} distinct, user key {:?}, nb {}, vb {vb}, event key {:?} eb {} es {}", distinct.len(), cx.uk, cx.nb, cx.ek, cx.eb, cx.es);
+            eprintln!("DIAG sample {} distinct, user key {:?}, nb {}, vb {vb}, event key {:?} eb {} ew {}", distinct.len(), cx.uk, cx.nb, cx.ek, cx.eb, cx.ew);
         }
     }
     lap("keys");
@@ -1482,8 +1482,8 @@ fn main() {
                         };
                         if j < P - 1 {
                             tab.clear();
-                            tab.resize(1 << cx.es, u32::MAX);
-                            let base = (j as u64) << cx.es;
+                            let base = j as u64 * cx.ew;
+                            tab.resize(if j == P - 2 { cx.eb.saturating_sub(base) } else { cx.ew } as usize, u32::MAX);
                             for (ci, e) in rows {
                                 let k = (e.eid - base) as usize;
                                 if let Some(n) = keep((tab[k] != u32::MAX).then_some(tab[k]), ci, e) {
@@ -1554,12 +1554,21 @@ fn main() {
             &c[a..a + c[a..].partition_point(|x| x.person == key)]
         };
         lap("clicks grouped");
-        // clean runs, 32 jobs over the index partitions
+        // a person continuing across an index partition edge is one run, not two
+        let fp = |j: usize| pa[j].0.first().map(|x| x.person >> 9);
+        let lp = |j: usize| pa[j].0.last().map(|x| x.person >> 9);
+        for j in 1..P - 1 {
+            if let (Some(a), true) = (lp(j - 1), lp(j - 1) == fp(j)) {
+                rc[a as usize].fetch_sub(1, Relaxed);
+            }
+        }
+        // clean runs, 32 jobs over the index partitions; a run crossing edges belongs to the partition it starts in
         let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
             .into_par_iter()
             .map(|k| {
                 let (mut st, mut slow, mut tmp) = (new_st(), vec![], vec![]);
-                for f in pa[k * (P - 1) / 32..(k + 1) * (P - 1) / 32].iter().map(|x| &x.0) {
+                for j in k * (P - 1) / 32..(k + 1) * (P - 1) / 32 {
+                    let f = &pa[j].0;
                     let mut i = 0;
                     while i < f.len() {
                         let p = f[i].person >> 9;
@@ -1568,20 +1577,37 @@ fn main() {
                             e += 1;
                         }
                         let run = &f[i..e];
+                        let start = i > 0 || j == 0 || lp(j - 1) != Some(p);
                         i = e;
                         if rc[p as usize].load(Relaxed) != 1 {
                             slow.extend(run.iter().map(|x| Ev2 { person: mix(x.person), ..*x }));
                             continue;
                         }
-                        // aliases with different labels are different persons: group by label, then ts
-                        let r = if run.windows(2).all(|w| w[0].person == w[1].person && w[0].ts <= w[1].ts) {
-                            run
-                        } else {
+                        if !start {
+                            continue;
+                        }
+                        let srt = |r: &[Ev2]| r.windows(2).all(|w| w[0].person == w[1].person && w[0].ts <= w[1].ts);
+                        let chain = e == f.len() && j + 2 < P && fp(j + 1) == Some(p);
+                        let use_tmp = chain || !srt(run);
+                        if use_tmp {
                             tmp.clear();
                             tmp.extend_from_slice(run);
-                            tmp.sort_unstable_by_key(|x: &Ev2| (x.person, x.ts));
-                            &tmp[..]
-                        };
+                            let mut q = j + 1;
+                            while chain && q < P - 1 && fp(q) == Some(p) {
+                                let g = &pa[q].0;
+                                let n = g.iter().position(|x| x.person >> 9 != p).unwrap_or(g.len());
+                                tmp.extend_from_slice(&g[..n]);
+                                if n < g.len() {
+                                    break;
+                                }
+                                q += 1;
+                            }
+                            if !srt(&tmp) {
+                                // aliases with different labels are different persons: group by label, then ts
+                                tmp.sort_unstable_by_key(|x: &Ev2| (x.person, x.ts));
+                            }
+                        }
+                        let r: &[Ev2] = if use_tmp { &tmp } else { run };
                         let mut a = 0;
                         while a < r.len() {
                             let v = r[a].person;
