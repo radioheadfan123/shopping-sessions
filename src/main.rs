@@ -106,20 +106,35 @@ type Map<V> = HashMap<u64, V, BuildHasherDefault<IdH>>; // keys are already hash
 
 /// Flat open-addressing u64 -> u64 table, one cache line per probe, so lookups can be prefetched.
 /// Key 0 marks an empty slot; a real 0 key is stored as 1 (a 2^-64 merge, below the hash's own collision odds).
+/// f: one bit per key (high hash bits), small enough to stay in cache, so a miss skips the table.
 struct Tab {
     s: Vec<(u64, u64)>,
     mask: usize,
+    f: Vec<u64>,
+    fb: u32,
 }
 impl Tab {
     fn new(n: usize) -> Tab {
         let cap = (n * 2).next_power_of_two().max(16);
-        Tab { s: vec![(0, 0); cap], mask: cap - 1 }
+        let fb = (n * 8).next_power_of_two().max(64).trailing_zeros();
+        Tab { s: vec![(0, 0); cap], mask: cap - 1, f: vec![0; 1 << (fb - 6)], fb }
+    }
+    #[inline(always)]
+    fn bit(&self, k: u64) -> usize {
+        (k.max(1) >> (64 - self.fb)) as usize
+    }
+    #[inline(always)]
+    fn may(&self, k: u64) -> bool {
+        let b = self.bit(k);
+        unsafe { *self.f.get_unchecked(b >> 6) >> (b & 63) & 1 != 0 }
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
         k.max(1) as usize & self.mask
     }
     fn insert(&mut self, k: u64, v: u64) {
+        let b = self.bit(k);
+        self.f[b >> 6] |= 1 << (b & 63);
         let (k, mut i) = (k.max(1), self.slot(k));
         while self.s[i].0 != 0 && self.s[i].0 != k {
             i = (i + 1) & self.mask;
@@ -128,6 +143,9 @@ impl Tab {
     }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u64> {
+        if !self.may(k) {
+            return None;
+        }
         let (k, mut i) = (k.max(1), self.slot(k));
         loop {
             let (a, v) = self.s[i];
@@ -143,7 +161,9 @@ impl Tab {
     #[inline(always)]
     fn prefetch(&self, k: u64) {
         use std::arch::x86_64::*;
-        unsafe { _mm_prefetch(self.s.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0) }
+        if self.may(k) {
+            unsafe { _mm_prefetch(self.s.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0) }
+        }
     }
 }
 const PF: usize = 16; // prefetch distance in rows
