@@ -741,27 +741,25 @@ fn main() {
                 .map(|p| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
                     let cap = (n * 2).next_power_of_two().max(16);
-                    let (mut keys, mut slot) = (vec![0u64; cap], vec![u32::MAX; cap]);
+                    let mut tab = vec![(0u64, u32::MAX); cap]; // (eid, row in best)
                     let mut best: Vec<Ev> = Vec::with_capacity(n);
                     for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
-                        {
-                            let mut h = e.eid as usize & (cap - 1);
-                            loop {
-                                if slot[h] == u32::MAX {
-                                    keys[h] = e.eid;
-                                    slot[h] = best.len() as u32;
-                                    best.push(*e);
-                                    break;
-                                }
-                                if keys[h] == e.eid {
-                                    let b = &mut best[slot[h] as usize];
-                                    if e.ingest < b.ingest {
-                                        *b = *e;
-                                    }
-                                    break;
-                                }
-                                h = (h + 1) & (cap - 1);
+                        let mut h = e.eid as usize & (cap - 1);
+                        loop {
+                            let t = &mut tab[h];
+                            if t.1 == u32::MAX {
+                                *t = (e.eid, best.len() as u32);
+                                best.push(*e);
+                                break;
                             }
+                            if t.0 == e.eid {
+                                let b = &mut best[t.1 as usize];
+                                if e.ingest < b.ingest {
+                                    *b = *e;
+                                }
+                                break;
+                            }
+                            h = (h + 1) & (cap - 1);
                         }
                     }
                     let mut b = Bk::new(best.len());
