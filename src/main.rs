@@ -1563,12 +1563,15 @@ fn main() {
             }
         }
         // clean runs, 32 jobs over the index partitions; a run crossing edges belongs to the partition it starts in
+        // jobs split by survivor count: survivors cluster unevenly over the index range
+        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len(); Some(*a) })).collect();
+        let jb: Vec<usize> = (0..=32).map(|k| if k == 32 { P - 1 } else { cum.partition_point(|&c| c * 32 < k * cum[P - 1]) }).collect();
         let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
             .into_par_iter()
             .map(|k| {
                 let (mut st, mut slow, mut tmp) = (new_st(), vec![], vec![]);
                 let tj = std::time::Instant::now();
-                for j in k * (P - 1) / 32..(k + 1) * (P - 1) / 32 {
+                for j in jb[k]..jb[k + 1].max(jb[k]) {
                     let f = &pa[j].0;
                     let mut i = 0;
                     while i < f.len() {
