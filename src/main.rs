@@ -758,6 +758,7 @@ fn main() {
         return;
     }
     // 1: events by event_id partition, in parallel with links
+    let diag: u32 = env("DIAG", "0").parse().unwrap();
     let lp = pairs(&csvs(&data.join("links")));
     let ((pmap, names), s1) = rayon::join(
         || person_tab(lp),
@@ -766,13 +767,19 @@ fn main() {
                 .par_iter()
                 .map(|&(d, h)| {
                     let mut b = Bk::new(d.len() / 70);
-                    scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
+                    match diag {
+                        1 => scan::<7>(d, h, |f| { std::hint::black_box(f); }),
+                        2 => scan::<7>(d, h, |f| { std::hint::black_box(event(f, &cx)); }),
+                        3 => { let mut s = 0u64; scan::<7>(d, h, |f| { if let Some(e) = event(f, &cx) { s = s.wrapping_add(e.eid ^ e.uh ^ e.loc ^ e.ts as u64 ^ e.ingest as u64 ^ e.pc as u64) } }); std::hint::black_box(s); }
+                        _ => scan::<7>(d, h, |f| parse_event(f, &cx, &mut b)),
+                    }
                     b
                 })
                 .collect::<Vec<_>>()
         },
     );
     lap("links + events parsed");
+    if diag > 0 { return }
     let person = |u: u64| pmap.get(u).unwrap_or(u);
 
     // 2: clicks by person; events deduped, then by person
