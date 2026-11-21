@@ -190,7 +190,8 @@ fn map(path: &Path) -> &'static [u8] {
         return &[];
     }
     unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_POPULATE, f.as_raw_fd(), 0);
+        let pop = if std::env::var("NOPOP").is_ok() { 0 } else { libc::MAP_POPULATE };
+        let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE | pop, f.as_raw_fd(), 0);
         assert!(p != libc::MAP_FAILED, "mmap {path:?}");
         std::slice::from_raw_parts(p as *const u8, n)
     }
