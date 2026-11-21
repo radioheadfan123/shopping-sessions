@@ -111,6 +111,11 @@ impl Tab {
 }
 const PF: usize = 16; // prefetch distance in rows
 
+thread_local! {
+    /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
+    static SCRATCH: std::cell::RefCell<(Vec<u64>, Vec<Ev>)> = Default::default();
+}
+
 #[inline(always)]
 fn mum(a: u64, b: u64) -> u64 {
     let r = a as u128 * b as u128;
@@ -631,7 +636,7 @@ fn persons(files: &[&'static [u8]]) -> (Tab, Map<u64>) {
 
 fn main() {
     let t0 = std::time::Instant::now();
-    let lap = |what: &str| if std::env::var("PROF").is_ok() { { let mut r: libc::rusage = unsafe { std::mem::zeroed() }; unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }; eprintln!("{:>7.1} ms {what} flt {}", t0.elapsed().as_secs_f64() * 1e3, r.ru_minflt) } };
+    let lap = |what: &str| if std::env::var("PROF").is_ok() { { let mut r: libc::rusage = unsafe { std::mem::zeroed() }; unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }; let cpu = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3; eprintln!("{:>7.1} ms {what} cpu {:.0}+{:.0} flt {}", t0.elapsed().as_secs_f64() * 1e3, cpu(r.ru_utime), cpu(r.ru_stime), r.ru_minflt) } };
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let data = std::path::PathBuf::from(env("DATA_DIR", "/data"));
     let out = std::path::PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -705,7 +710,7 @@ fn main() {
     let person = |u: u64| pmap.get(u).unwrap_or(u);
 
     // 2: clicks by person; events deduped, then by person
-    let (cl, s2) = rayon::join(
+    let (fc, fd) = (
         || {
             chunks(&csvs(&data.join("clicks")))
                 .par_iter()
@@ -738,22 +743,25 @@ fn main() {
         || {
             (0..P)
                 .into_par_iter()
-                .map(|p| {
+                .map(|p| SCRATCH.with_borrow_mut(|(tab, best)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
                     let cap = (n * 2).next_power_of_two().max(16);
-                    let mut tab = vec![(0u64, u32::MAX); cap]; // (eid, row in best)
-                    let mut best: Vec<Ev> = Vec::with_capacity(n);
+                    // reused per thread: no fresh mmap, page faults and munmap for every partition
+                    tab.clear();
+                    tab.resize(cap, u64::MAX); // tag (eid bits 24..56) << 32 | row in best
+                    best.clear();
+                    best.reserve(n);
                     for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
-                        let mut h = e.eid as usize & (cap - 1);
+                        let (tag, mut h) = ((e.eid >> 24) as u32, e.eid as usize & (cap - 1));
                         loop {
-                            let t = &mut tab[h];
-                            if t.1 == u32::MAX {
-                                *t = (e.eid, best.len() as u32);
+                            let t = tab[h];
+                            if t == u64::MAX {
+                                tab[h] = (tag as u64) << 32 | best.len() as u64;
                                 best.push(*e);
                                 break;
                             }
-                            if t.0 == e.eid {
-                                let b = &mut best[t.1 as usize];
+                            if (t >> 32) as u32 == tag && best[t as u32 as usize].eid == e.eid {
+                                let b = &mut best[t as u32 as usize];
                                 if e.ingest < b.ingest {
                                     *b = *e;
                                 }
@@ -775,10 +783,17 @@ fn main() {
                         b.push((q >> 56) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, price: e.price, cat: e.cat });
                     }
                     b
-                })
+                }))
                 .collect::<Vec<_>>()
         },
     );
+    let (cl, s2) = if std::env::var("SEQ").is_ok() {
+        let cl = fc();
+        lap("clicks parsed");
+        (cl, fd())
+    } else {
+        rayon::join(fc, fd)
+    };
     lap("clicks parsed, events deduped");
     drop(s1);
     lap("s1 dropped");
