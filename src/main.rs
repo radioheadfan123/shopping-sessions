@@ -1554,10 +1554,13 @@ fn main() {
         // lookups stay local; the rest by key in hash partitions
         let vb = cx.nb << 9;
         let mut fk: Vec<(u64, Cl)> = cl.par_iter().flat_map_iter(|c| (0..P).flat_map(move |q| c.get(q)).flatten().map(|x| (unmix(x.person), *x)).filter(|x| x.0 < vb)).collect();
+        lap("fast clicks collected");
         fk.par_sort_unstable_by_key(|x| (x.0, x.1.ts));
+        lap("fast clicks sorted");
         let fvs: Vec<u64> = fk.par_iter().map(|x| x.0).collect();
         let fcs: Vec<Cl> = fk.par_iter().map(|x| x.1).collect();
         drop(fk);
+        lap("fast clicks split");
         let cs: Vec<Vec<Cl>> = (0..P)
             .into_par_iter()
             .map(|q| {
