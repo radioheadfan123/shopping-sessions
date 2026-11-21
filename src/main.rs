@@ -43,8 +43,7 @@ unsafe impl std::alloc::GlobalAlloc for Big {
             let off = BUMP.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             if off + n <= ARENA_SZ {
                 let a = base + off;
-                unsafe { libc::madvise(a as *mut libc::c_void, n, 23) }; // MADV_POPULATE_WRITE (Linux 5.14+); a no-op error before that
-                return a as *mut u8;
+                return a as *mut u8; // no populate: huge-page faults now run in parallel, and untouched headroom is never zeroed
             }
         }
         unsafe {
