@@ -87,7 +87,9 @@ const WEEK: i64 = 7 * DAY;
 const PB: u32 = 10; // partition bits
 const P: usize = 1 << PB; // partitions, picked by the top PB bits of a hash
 const BAD: u32 = u32::MAX;
-const CHUNK: usize = 8 << 20;
+fn kn(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
 const _: () = assert!(std::mem::size_of::<Ev>() == 32);
 
 #[derive(Default)]
@@ -233,10 +235,11 @@ fn csvs(dir: &Path) -> Vec<&'static [u8]> {
 /// Pieces of about CHUNK bytes ending on a line break; the bool says "starts the file" (skip the header).
 fn chunks(files: &[&'static [u8]]) -> Vec<(&'static [u8], bool)> {
     let mut out = vec![];
+    let chunk = kn("CH", 8) << 20;
     for &d in files {
         let mut s = 0;
         while s < d.len() {
-            let e = if d.len() - s <= CHUNK { d.len() } else { memchr(b'\n', &d[s + CHUNK..]).map_or(d.len(), |p| s + CHUNK + p + 1) };
+            let e = if d.len() - s <= chunk { d.len() } else { memchr(b'\n', &d[s + chunk..]).map_or(d.len(), |p| s + chunk + p + 1) };
             out.push((&d[s..e], s == 0));
             s = e;
         }
@@ -568,7 +571,11 @@ struct Bk<T> {
 }
 impl<T: Copy> Bk<T> {
     fn new(n: usize) -> Self {
-        let cap = (n / P + n / P / 4 + 16).next_multiple_of(8); // 8 rows of 40 B = 5 whole lines, for streaming
+        let sz = std::mem::size_of::<T>();
+        let mut cap = (n / P + n / P / kn("HR", 4) + kn("PAD", 16)).next_multiple_of(8); // 8 rows: whole lines, for streaming
+        if kn("FILL", 0) == 1 {
+            cap = ((cap * P * sz).next_multiple_of(BIG) / (P * sz)) & !7; // the block is zeroed anyway: use it all
+        }
         Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
     }
     #[inline(always)]
