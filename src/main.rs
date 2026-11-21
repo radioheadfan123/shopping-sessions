@@ -458,12 +458,10 @@ fn price(s: &[u8]) -> Option<u32> {
 #[derive(Clone, Copy)]
 struct Ev {
     eid: u64,
-    user: u64,
-    loc: u64,
+    loc: u64, // user_id; its hash is taken only for dedup winners
     ts: u32,
     ingest: u32, // seconds after window_start - 40 days
-    price: u32,  // 0 unless a purchase
-    cat: u32,
+    pc: u32,     // price (0 unless a purchase) | category << 24
 }
 
 /// Valid, deduped event, keyed by person.
@@ -472,8 +470,7 @@ struct Ev2 {
     person: u64,
     loc: u64,
     ts: u32,
-    price: u32,
-    cat: u32,
+    pc: u32, // as in Ev
 }
 
 #[derive(Clone, Copy)]
@@ -553,15 +550,14 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
     }
     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
     let eid = hash(f[0]);
-    let mut e = Ev { eid, user: 0, loc: 0, ts: BAD, ingest: (ingest.saturating_sub(cx.ws - 40 * DAY) / 1000).clamp(0, u32::MAX as i64) as u32, price: 0, cat: 0 };
+    let mut e = Ev { eid, loc: 0, ts: BAD, ingest: (ingest.saturating_sub(cx.ws - 40 * DAY) / 1000).clamp(0, u32::MAX as i64) as u32, pc: 0 };
     if let Some(ts) = parse_ts(f[2]) {
         if !f[1].is_empty() && ts >= cx.ws && ts < cx.we && !f[5].is_empty() && ingest.saturating_sub(ts) <= DAY {
             let ok = match f[4] {
                 b"view" | b"cart" => true,
                 b"purchase" => match price(f[6]) {
                     Some(p) => {
-                        e.price = p;
-                        e.cat = *cx.prod.get(&hash(f[5])).unwrap_or(&cx.unknown);
+                        e.pc = p | *cx.prod.get(&hash(f[5])).unwrap_or(&cx.unknown) << 24; // price <= 1e7 < 2^24
                         true
                     }
                     None => false,
@@ -570,7 +566,6 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
             };
             if ok {
                 e.ts = (ts - cx.ws) as u32;
-                e.user = hash(f[1]);
                 e.loc = loc(f[1]);
             }
         }
@@ -659,6 +654,7 @@ fn main() {
     });
     catnames.sort_unstable();
     catnames.dedup();
+    assert!(catnames.len() <= 256, "category index must fit 8 bits"); // ponytail: generator makes 20
     let catidx = |c: &[u8]| catnames.binary_search(&c).unwrap() as u32;
     let prod: Map<u32> = prodcat.iter().map(|&(h, c)| (h, catidx(c))).collect();
     let (mut campid, mut chan): (Vec<&'static [u8]>, Vec<&'static [u8]>) = (vec![], vec![]);
@@ -751,7 +747,12 @@ fn main() {
                     tab.resize(cap, u64::MAX); // tag (eid bits 24..56) << 32 | row in best
                     best.clear();
                     best.reserve(n);
+                    let mut ahead = s1.iter().flat_map(|c| c.get(p)).flatten().skip(PF);
                     for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
+                        if let Some(a) = ahead.next() {
+                            use std::arch::x86_64::*;
+                            unsafe { _mm_prefetch(tab.as_ptr().add(a.eid as usize & (cap - 1)) as *const i8, _MM_HINT_T0) }
+                        }
                         let (tag, mut h) = ((e.eid >> 24) as u32, e.eid as usize & (cap - 1));
                         loop {
                             let t = tab[h];
@@ -771,16 +772,24 @@ fn main() {
                         }
                     }
                     let mut b = Bk::new(best.len());
+                    let user = |e: &Ev| if e.ts == BAD { 0 } else { hash(at(e.loc)) };
+                    let mut ring = [0u64; PF]; // user hashes of the next PF rows, already prefetched
+                    for (r, e) in ring.iter_mut().zip(best.iter()) {
+                        *r = user(e);
+                        pmap.prefetch(*r);
+                    }
                     for i in 0..best.len() {
+                        let u = ring[i % PF];
                         if let Some(n) = best.get(i + PF) {
-                            pmap.prefetch(n.user);
+                            ring[i % PF] = user(n);
+                            pmap.prefetch(ring[i % PF]);
                         }
                         let e = &best[i];
                         if e.ts == BAD {
                             continue;
                         }
-                        let q = person(e.user);
-                        b.push((q >> 56) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, price: e.price, cat: e.cat });
+                        let q = person(u);
+                        b.push((q >> 56) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
                     }
                     b
                 }))
@@ -807,14 +816,17 @@ fn main() {
         camp: Vec<[i64; 4]>, // sessions, purchasing, revenue, assisted; index camp * ndays + day
         seen: Vec<u32>,
         stamp: u32,
+        ev: Vec<Ev2>, // sort buffers, reused across partitions: no fresh pages to zero each time
+        ck: Vec<Cl>,
     }
     let states: Vec<St> = (0..P)
         .into_par_iter()
         .fold(
-            || St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0 },
+            || St { rows: vec![], camp: vec![[0; 4]; (ncamp + 1) * ndays], seen: vec![0; ncamp], stamp: 0, ev: vec![], ck: vec![] },
             |mut st, q| {
-                let ev = group(&s2, q, |e| (e.person, e.ts));
-                let ck = group(&cl, q, |c| (c.person, c.ts));
+                let (mut ev, mut ck) = (std::mem::take(&mut st.ev), std::mem::take(&mut st.ck));
+                group(&s2, q, |e| (e.person, e.ts), &mut ev);
+                group(&cl, q, |c| (c.person, c.ts), &mut ck);
                 let (mut i, mut ci) = (0, 0);
                 while i < ev.len() {
                     let pk = ev[i].person;
@@ -849,12 +861,13 @@ fn main() {
                             st.rows.push(r);
                         }
                         for e in &ev[k..m] {
-                            if e.price > 0 {
-                                rev += e.price as i64;
+                            let (price, cat) = ((e.pc & 0xff_ffff) as i64, e.pc >> 24);
+                            if price > 0 {
+                                rev += price;
                                 buy = true;
-                                match cats.iter_mut().find(|c| c.0 == e.cat) {
-                                    Some(c) => c.1 += e.price as i64,
-                                    None => cats.push((e.cat, e.price as i64)),
+                                match cats.iter_mut().find(|c| c.0 == cat) {
+                                    Some(c) => c.1 += price,
+                                    None => cats.push((cat, price)),
                                 }
                             }
                         }
@@ -901,6 +914,7 @@ fn main() {
                     }
                     i = j;
                 }
+                (st.ev, st.ck) = (ev, ck);
                 st
             },
         )
@@ -945,7 +959,7 @@ fn main() {
 
 /// Partition q of every chunk, ordered by key: one counting pass on the person bits under the
 /// partition byte (about 8 rows per bucket), then a small sort per bucket.
-fn group<T: Copy>(src: &[Bk<T>], q: usize, key: impl Fn(&T) -> (u64, u32)) -> Vec<T> {
+fn group<T: Copy>(src: &[Bk<T>], q: usize, key: impl Fn(&T) -> (u64, u32), out: &mut Vec<T>) {
     let n: usize = src.iter().map(|c| c.len(q)).sum();
     let bits = (usize::BITS - (n / 8).leading_zeros()).clamp(1, 16);
     let b = |x: &T| (key(x).0 >> (56 - bits)) as usize & ((1 << bits) - 1);
@@ -956,7 +970,8 @@ fn group<T: Copy>(src: &[Bk<T>], q: usize, key: impl Fn(&T) -> (u64, u32)) -> Ve
     for i in 1..at.len() {
         at[i] += at[i - 1];
     }
-    let mut out = Vec::with_capacity(n);
+    out.clear();
+    out.reserve(n);
     let o = out.spare_capacity_mut();
     for x in src.iter().flat_map(|c| c.get(q)).flatten() {
         let k = b(x);
@@ -969,7 +984,6 @@ fn group<T: Copy>(src: &[Bk<T>], q: usize, key: impl Fn(&T) -> (u64, u32)) -> Ve
         out[s..e as usize].sort_unstable_by_key(&key);
         s = e as usize;
     }
-    out
 }
 
 /// Category with the highest purchase sum, ties to the smallest name (indices are in name order); clears the list.
