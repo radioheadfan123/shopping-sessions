@@ -719,30 +719,54 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
         }
     }
     pr("union");
+    // the rest runs in parallel beside the event parse: read-only finds (union halved the paths),
+    // smallest name per set by CAS, then idx's values rewritten in place from index to person key
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     let n = ids.len();
-    let mut best = vec![u32::MAX; n];
-    for x in 0..n as u32 {
-        let r = find(&mut parent, x) as usize;
-        if best[r] == u32::MAX || at(ids[x as usize].0) < at(ids[best[r] as usize].0) {
-            best[r] = x;
+    let root: Vec<u32> = (0..n as u32)
+        .into_par_iter()
+        .map(|mut x| {
+            while parent[x as usize] != x {
+                x = parent[x as usize];
+            }
+            x
+        })
+        .collect();
+    let best: Vec<AtomicU32> = (0..n as u32).into_par_iter().map(AtomicU32::new).collect();
+    (0..n).into_par_iter().for_each(|x| {
+        let b = &best[root[x] as usize];
+        let mut cur = b.load(Relaxed);
+        while at(ids[x].0) < at(ids[cur as usize].0) {
+            match b.compare_exchange_weak(cur, x as u32, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
         }
-    }
+    });
     pr("best");
-    let mut pmap = Tab::new(n);
-    let mut names: Map<u64> = Map::with_capacity_and_hasher(n / 2, Default::default());
-    for x in 0..n {
-        if let Some(a) = ids.get(x + PF) {
-            pmap.prefetch(a.1);
+    let (sp, mask) = (idx.s.as_mut_ptr() as usize, idx.mask);
+    (0..n).into_par_iter().for_each(|x| {
+        let key = ids[best[root[x] as usize].load(Relaxed) as usize].1;
+        let k = ids[x].1.max(1);
+        let s = sp as *mut (u64, u64);
+        let mut i = k as usize & mask;
+        unsafe {
+            while (*s.add(i)).0 != k {
+                i = (i + 1) & mask;
+            }
+            (*s.add(i)).1 = key; // each id owns its slot: disjoint writes
         }
-        let r = find(&mut parent, x as u32) as usize;
-        let (name, key) = ids[best[r] as usize];
-        pmap.insert(ids[x].1, key);
-        if r == x {
-            names.insert(key, name);
-        }
-    }
+    });
+    let names: Map<u64> = (0..n)
+        .into_par_iter()
+        .filter(|&x| root[x] as usize == x)
+        .map(|x| {
+            let (name, key) = ids[best[x].load(Relaxed) as usize];
+            (key, name)
+        })
+        .collect();
     pr("maps");
-    (pmap, names)
+    (idx, names)
 }
 
 fn main() {
