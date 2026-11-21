@@ -4,7 +4,7 @@
 pub const M40: u64 = (1 << 40) - 1;
 const A: u64 = 0x9E37_79B9_7F4B;
 const B: u64 = 0xD6E8_FEB8_6659;
-const fn inv(a: u64) -> u64 {
+pub const fn inv(a: u64) -> u64 {
     let mut x = a; // Newton: correct bits double each step
     let mut i = 0;
     while i < 6 {
@@ -143,6 +143,7 @@ mod tests {
         assert_eq!(b36(b"0"), Some(0));
         assert_eq!(b36(b"Ab"), None);
         assert_eq!(b36(b"zzzzzzzz"), None); // above 2^40
+        assert_eq!(b36(b"a-"), None);
     }
     #[test]
     fn keys() {

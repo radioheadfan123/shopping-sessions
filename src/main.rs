@@ -100,6 +100,15 @@ fn mix(mut v: u64) -> u64 {
     v = v.wrapping_mul(0x94d0_49bb_1331_11eb);
     v ^ v >> 31
 }
+/// Inverse of mix.
+#[inline(always)]
+fn unmix(mut v: u64) -> u64 {
+    v ^= v >> 31 ^ v >> 62;
+    v = v.wrapping_mul(const { dec::inv(0x94d0_49bb_1331_11eb) });
+    v ^= v >> 27 ^ v >> 54;
+    v = v.wrapping_mul(const { dec::inv(0xbf58_476d_1ce4_e5b9) });
+    v ^ v >> 30 ^ v >> 60
+}
 fn kn(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
@@ -1554,6 +1563,15 @@ fn main() {
             let a = c.partition_point(|x| x.person < key);
             &c[a..a + c[a..].partition_point(|x| x.person == key)]
         };
+        // fast persons' clicks by person number too: a job walks persons in that order, so lookups stay local
+        let vb = cx.nb << 9;
+        let mut fcs: Vec<Cl> = cs.par_iter().flat_map_iter(|c| c.iter().filter(|x| unmix(x.person) < vb).copied()).collect();
+        fcs.par_sort_unstable_by_key(|x| (unmix(x.person), x.ts));
+        let fvs: Vec<u64> = fcs.par_iter().map(|x| unmix(x.person)).collect();
+        let fclk = |v: u64| -> &[Cl] {
+            let a = fvs.partition_point(|&x| x < v);
+            &fcs[a..a + fvs[a..].partition_point(|&x| x == v)]
+        };
         lap("clicks grouped");
         // a person continuing across an index partition edge is one run, not two
         let fp = |j: usize| pa[j].0.first().map(|x| x.person >> 9);
@@ -1621,7 +1639,7 @@ fn main() {
                                 b += 1;
                             }
                             let name = fname(v, &mut st.nbuf);
-                            body(&mut st, &r[a..b], clk(mix(v)), name);
+                            body(&mut st, &r[a..b], fclk(v), name);
                             a = b;
                         }
                     }
@@ -1867,4 +1885,11 @@ fn write_camp(path: &Path, rows: &[(&[u8], &[u8], i32, [i64; 4])]) {
     }
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+#[test]
+fn unmix_inverts_mix() {
+    for v in [0u64, 1, 511, 1 << 40, 0x1234_5678_9abc_def0, u64::MAX] {
+        assert_eq!(unmix(mix(v)), v);
+    }
 }
