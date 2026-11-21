@@ -576,13 +576,6 @@ impl<T: Copy> Bk<T> {
 }
 
 #[inline(always)]
-fn parse_event(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut Bk<Ev>) {
-    if let Some(e) = event(f, cx) {
-        out.push((e.eid >> (64 - PB)) as usize, e);
-    }
-}
-
-#[inline(always)]
 fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
     if f[0].is_empty() {
         return None;
@@ -758,6 +751,14 @@ fn main() {
         return;
     }
     // 1: events by event_id partition, in parallel with links
+    // event_id seen / seen-twice bitsets (2^30 bits each): an event whose dup bit is clear has a
+    // unique id, so only the few with it set (true duplicates + about 2% bit collisions) go
+    // through the event_id scatter and dedup tables; the rest go straight to their person partition
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    const NB: usize = 1 << 24;
+    let bit = |h: u64| ((h >> 6) as usize & (NB - 1), 1u64 << (h & 63));
+    let pf = |x: &AtomicU64| unsafe { std::arch::x86_64::_mm_prefetch(x as *const AtomicU64 as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    let (seen, dup): (Vec<AtomicU64>, Vec<AtomicU64>) = rayon::join(|| (0..NB).into_par_iter().map(|_| AtomicU64::new(0)).collect(), || (0..NB).into_par_iter().map(|_| AtomicU64::new(0)).collect());
     let lp = pairs(&csvs(&data.join("links")));
     let ((pmap, names), s1) = rayon::join(
         || person_tab(lp),
@@ -765,9 +766,23 @@ fn main() {
             chunks(&csvs(&data.join("events")))
                 .par_iter()
                 .map(|&(d, h)| {
-                    let mut b = Bk::new(d.len() / 70);
-                    scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
-                    b
+                    let mut v: Vec<Ev> = Vec::with_capacity(d.len() / 60);
+                    scan::<7>(d, h, |f| {
+                        if let Some(e) = event(f, &cx) {
+                            v.push(e)
+                        }
+                    });
+                    // seen bit per event_id hash; a second sighting marks it in `dup`
+                    for i in 0..v.len() {
+                        if let Some(n) = v.get(i + PF) {
+                            pf(&seen[bit(n.eid).0]);
+                        }
+                        let (w, m) = bit(v[i].eid);
+                        if seen[w].fetch_or(m, Relaxed) & m != 0 {
+                            dup[w].fetch_or(m, Relaxed);
+                        }
+                    }
+                    v
                 })
                 .collect::<Vec<_>>()
         },
@@ -807,8 +822,34 @@ fn main() {
                 .collect::<Vec<_>>()
         },
         || {
+            // unique ids straight to their person partition; possible duplicates by event_id partition
+            let (mut s2, cands): (Vec<Bk<Ev2>>, Vec<Bk<Ev>>) = s1
+                .par_chunks(s1.len().div_ceil(64).max(1))
+                .map(|cs| {
+                    let n: usize = cs.iter().map(|v| v.len()).sum();
+                    let (mut out, mut cand) = (Bk::new(n), Bk::new(n / 8));
+                    for v in cs {
+                        for i in 0..v.len() {
+                            if let Some(x) = v.get(i + PF) {
+                                pf(&dup[bit(x.eid).0]);
+                                pmap.prefetch(x.uh);
+                            }
+                            let e = &v[i];
+                            let (w, m) = bit(e.eid);
+                            if dup[w].load(Relaxed) & m != 0 {
+                                cand.push((e.eid >> (64 - PB)) as usize, *e);
+                            } else if e.ts != BAD {
+                                let q = person(e.uh);
+                                out.push((q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
+                            }
+                        }
+                    }
+                    (out, cand)
+                })
+                .unzip();
+            let s1 = cands;
             // 32 jobs of P / 32 partitions, each filling one output: one bucket set per job, not per partition
-            (0..32)
+            s2.extend((0..32)
                 .into_par_iter()
                 .map(|k| {
                     let ps = k * P / 32..(k + 1) * P / 32;
@@ -869,7 +910,8 @@ fn main() {
                     }
                     b
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>());
+            s2
         },
     );
     let (cl, s2) = if std::env::var("SEQ").is_ok() {
