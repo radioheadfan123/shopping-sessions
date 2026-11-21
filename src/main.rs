@@ -841,6 +841,11 @@ impl Slots {
         let s = self.s[i][0].load(std::sync::atomic::Ordering::Relaxed);
         (s != 0).then(|| ((!s >> 32) as u32, (!s & 0xffff_ffff) as usize))
     }
+    /// Slot i as a place for 24 B rows: a walk over slots a.. may write its k-th output at base(a) + k
+    /// once it has read slots a..=a + k, since 24 B rows never pass the 32 B slots they come from
+    fn base(&self, i: usize) -> *mut Ev2 {
+        self.s[i..].as_ptr() as *mut Ev2 // atomics are UnsafeCell: writing through them is allowed
+    }
     /// The surviving row at index i as an Ev (eid and ingest left 0)
     #[inline(always)]
     fn get(&self, i: usize) -> Ev {
@@ -1587,19 +1592,16 @@ fn main() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         let rc: Vec<AtomicU32> = (0..cx.nb).into_par_iter().map(|_| AtomicU32::new(0)).collect();
         let fastv = |e: &Ev| if e.uh & FAST != 0 { fkey(e.uh & !FAST).map(|r| r.1) } else { None };
-        // fast survivors go to one big buffer (huge pages, no regrowth), each partition to its own exact-size slice
+        // fast survivors are compacted in place over their own partition's slots: no fresh memory to fault
         let slt = slots.as_ref().unwrap();
         // index range of partition j < P - 1
         let rng = |j: usize| (j as u64 * cx.ew).min(cx.eb)..if j == P - 2 { cx.eb } else { ((j as u64 + 1) * cx.ew).min(cx.eb) };
-        let off: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, j| { *a += if j < P - 1 { rng(j).count() } else { 0 }; Some(*a) })).collect();
-        let mut fbuf: Vec<Ev2> = Vec::with_capacity(off[P]);
-        let fb = fbuf.as_mut_ptr() as usize;
         let (cl, pa) = seqjoin(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
             let r = (0..P)
                 .into_par_iter()
                 .map(|j| {
                     let (mut nf, mut sl, mut nr) = (0usize, vec![], 0usize); // fast survivors (index order), slow ones, runs
-                    let fp = unsafe { (fb as *mut Ev2).add(off[j]) };
+                    let fp = if j < P - 1 { slt.base(rng(j).start as usize) } else { std::ptr::NonNull::dangling().as_ptr() };
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                         best.clear();
                         bc.clear();
@@ -1669,7 +1671,7 @@ fn main() {
                             }
                         }
                     });
-                    // partition j wrote only [off[j], off[j] + nf), and fbuf outlives pa
+                    // partition j wrote only over its own slots, which are never unmapped
                     (unsafe { std::slice::from_raw_parts(fp as *const Ev2, nf) }, sl, nr)
                 })
                 .collect::<Vec<_>>();
