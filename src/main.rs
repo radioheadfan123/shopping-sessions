@@ -1604,6 +1604,11 @@ fn main() {
             let co: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, q| { *a += cl.iter().map(|c| c.len(q)).sum::<usize>(); Some(*a) })).collect();
             let mut cbuf: Vec<Cl> = Vec::with_capacity(co[P]);
             let cb = cbuf.as_mut_ptr() as usize;
+            if std::env::var("DIAG").is_ok() {
+                let mut z: Vec<usize> = (0..P).map(|q| co[q + 1] - co[q]).collect();
+                z.sort_unstable_by(|a, b| b.cmp(a));
+                eprintln!("DIAG clicks {} top {:?}", co[P], &z[..12]);
+            }
             let cs: Vec<&'static [Cl]> = (0..P)
                 .into_par_iter()
                 .map(|q| {
