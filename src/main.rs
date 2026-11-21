@@ -458,7 +458,8 @@ fn price(s: &[u8]) -> Option<u32> {
 #[derive(Clone, Copy)]
 struct Ev {
     eid: u64,
-    loc: u64, // user_id; its hash is taken only for dedup winners
+    loc: u64, // user_id
+    uh: u64,  // hash of user_id, taken while the line is still in cache
     ts: u32,
     ingest: u32, // seconds after window_start - 40 days
     pc: u32,     // price (0 unless a purchase) | category << 24
@@ -550,7 +551,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
     }
     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
     let eid = hash(f[0]);
-    let mut e = Ev { eid, loc: 0, ts: BAD, ingest: (ingest.saturating_sub(cx.ws - 40 * DAY) / 1000).clamp(0, u32::MAX as i64) as u32, pc: 0 };
+    let mut e = Ev { eid, loc: 0, uh: 0, ts: BAD, ingest: (ingest.saturating_sub(cx.ws - 40 * DAY) / 1000).clamp(0, u32::MAX as i64) as u32, pc: 0 };
     if let Some(ts) = parse_ts(f[2]) {
         if !f[1].is_empty() && ts >= cx.ws && ts < cx.we && !f[5].is_empty() && ingest.saturating_sub(ts) <= DAY {
             let ok = match f[4] {
@@ -567,6 +568,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
             if ok {
                 e.ts = (ts - cx.ws) as u32;
                 e.loc = loc(f[1]);
+                e.uh = hash(f[1]);
             }
         }
     }
@@ -772,7 +774,7 @@ fn main() {
                         }
                     }
                     let mut b = Bk::new(best.len());
-                    let user = |e: &Ev| if e.ts == BAD { 0 } else { hash(at(e.loc)) };
+                    let user = |e: &Ev| e.uh;
                     let mut ring = [0u64; PF]; // user hashes of the next PF rows, already prefetched
                     for (r, e) in ring.iter_mut().zip(best.iter()) {
                         *r = user(e);
