@@ -790,12 +790,12 @@ impl<T: Copy + Default> Wc<T> {
 /// [key, uh, ts | off << 32, pc], where key = !(ingest << 32 | chunk) of the best row so far
 /// (0 = none yet), so the lowest ingest wins and ties keep the first seen (earlier chunk, or earlier
 /// in the same chunk: one thread walks a chunk in order and only a strictly better row replaces).
-/// A winner rechecks its key after writing the record: if another row won meanwhile, the record may
-/// be torn, so the index goes to `bad` and is rebuilt by rescanning the winning chunk.
+/// The key doubles as a lock: a winner CASes in its key with bit L clear, writes the record, then
+/// stores the key with L set (x86 keeps stores in order, so the record is complete when L shows).
 struct Slots {
     s: &'static [[std::sync::atomic::AtomicU64; 4]],
-    bad: std::sync::Mutex<Vec<u64>>,
 }
+const L: u64 = 1 << 31; // set in every finished key: chunk numbers stay below 2^31
 impl Slots {
     fn new(n: usize) -> Self {
         // fresh anonymous pages are zero: no fill, and the 2 MB faults run in parallel during phase 1
@@ -804,7 +804,7 @@ impl Slots {
             let p = libc::mmap(std::ptr::null_mut(), b, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
             assert!(p != libc::MAP_FAILED, "slots mmap");
             libc::madvise(p, b, libc::MADV_HUGEPAGE);
-            Slots { s: std::slice::from_raw_parts(p as *const _, n), bad: Default::default() }
+            Slots { s: std::slice::from_raw_parts(p as *const _, n) }
         }
     }
     #[inline(always)]
@@ -813,33 +813,26 @@ impl Slots {
         unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.s.as_ptr().add(i as usize) as *const i8) };
     }
     #[inline(always)]
-    fn write(&self, i: usize, e: &Ev) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let r = &self.s[i];
-        r[1].store(e.uh, Relaxed);
-        r[2].store(e.ts as u64 | (e.off as u64) << 32, Relaxed);
-        r[3].store(e.pc as u64, Relaxed);
-    }
-    #[inline(always)]
     fn put(&self, e: &Ev, ci: usize) {
         use std::sync::atomic::Ordering::*;
-        let i = e.eid as usize;
+        let r = &self.s[e.eid as usize];
         let s = !((e.ingest as u64) << 32 | ci as u64);
-        let k = &self.s[i][0];
-        let mut old = k.load(Relaxed);
         loop {
+            let old = r[0].load(Relaxed);
+            if old != 0 && old & L == 0 {
+                std::hint::spin_loop(); // another row is writing this slot
+                continue;
+            }
             if old >= s {
                 return;
             }
-            match k.compare_exchange_weak(old, s, SeqCst, Relaxed) {
-                Ok(_) => break,
-                Err(o) => old = o,
+            if r[0].compare_exchange_weak(old, s & !L, Acquire, Relaxed).is_ok() {
+                r[1].store(e.uh, Relaxed);
+                r[2].store(e.ts as u64 | (e.off as u64) << 32, Relaxed);
+                r[3].store(e.pc as u64, Relaxed);
+                r[0].store(s, Release);
+                return;
             }
-        }
-        self.write(i, e);
-        std::sync::atomic::fence(SeqCst);
-        if k.load(Relaxed) != s {
-            self.bad.lock().unwrap().push(i as u64);
         }
     }
     /// (ingest, chunk) of the surviving row at index i, if any
@@ -1251,6 +1244,7 @@ fn main() {
     lap("keys");
     let cx = cx;
     // decoded events go straight to their index slot; the rest (all events, without an event key) to s1
+    assert!(ech.len() < L as usize);
     let slots = cx.ek.map(|_| Slots::new(cx.eb as usize));
     let ((pt, (pmap, names)), (s1, odd)): (_, (Vec<Bk<Ev>>, Vec<Vec<Ev>>)) = rayon::join(
         || {
@@ -1309,41 +1303,6 @@ fn main() {
         },
     );
     lap("links + events parsed");
-    if let Some(sl) = &slots {
-        // torn records: rebuild each from the first row of its winning (ingest, chunk)
-        if std::env::var("CFTEST").is_ok() {
-            // test: rebuild every slot, scrambling its record first
-            let mut b = sl.bad.lock().unwrap();
-            for i in 0..cx.eb as usize {
-                if sl.win(i).is_some() {
-                    sl.write(i, &Ev { ts: 7, ..Default::default() });
-                    b.push(i as u64);
-                }
-            }
-        }
-        let mut bad: Vec<(usize, u64, u32)> = sl.bad.lock().unwrap().iter().map(|&i| { let (g, c) = sl.win(i as usize).unwrap(); (c, i, g) }).collect();
-        bad.sort_unstable();
-        bad.dedup();
-        if std::env::var("DIAG").is_ok() {
-            eprintln!("DIAG slot conflicts {}", bad.len());
-        }
-        bad.chunk_by(|a, b| a.0 == b.0).collect::<Vec<_>>().par_iter().for_each(|g| {
-            let (d, h) = ech[g[0].0];
-            let mut done = vec![false; g.len()];
-            scan::<7>(d, h, |f| {
-                if let Some((p, e)) = event(f, &cx, d.as_ptr()) {
-                    if p < P - 1 {
-                        if let Some(k) = (0..g.len()).find(|&k| !done[k] && g[k].1 == e.eid && g[k].2 == e.ingest) {
-                            done[k] = true;
-                            sl.write(e.eid as usize, &e);
-                        }
-                    }
-                }
-            });
-            assert!(done.iter().all(|&x| x), "slot conflict row not found");
-        });
-        lap("slot conflicts");
-    }
     let person = |u: u64| pmap.get(u).unwrap_or(u);
     // fast person: (key, loc) where the loc is person << 9 | label with no length bits (real locs have some)
     let fkey = |n: u64| -> Option<(u64, u64)> {
@@ -2078,5 +2037,39 @@ fn iso_table() {
                 assert_eq!(parse_ts(s.as_bytes()), want, "{s}");
             }
         }
+    }
+}
+
+#[test]
+fn slots_race() {
+    // 8 threads put rows over the same 64 indices: each slot must end with the lowest (ingest, chunk),
+    // and a whole record from that row
+    let sl = Slots::new(64);
+    std::thread::scope(|t| {
+        for ci in 0..8usize {
+            let sl = &sl;
+            t.spawn(move || {
+                for r in 0..20000u32 {
+                    let i = (r * 7 + ci as u32) % 64;
+                    let g = (r * 2654435761u32 ^ ci as u32) % 1000 + 5;
+                    sl.put(&Ev { eid: i as u64, uh: g as u64 * 3, ts: g * 5, ingest: g, pc: g * 7, off: g * 11 }, ci);
+                }
+            });
+        }
+    });
+    for i in 0..64 {
+        let mut best = (u32::MAX, usize::MAX);
+        for ci in 0..8usize {
+            for r in 0..20000u32 {
+                let g = (r * 2654435761u32 ^ ci as u32) % 1000 + 5;
+                if (r * 7 + ci as u32) % 64 == i && (g, ci) < best {
+                    best = (g, ci);
+                }
+            }
+        }
+        let (g, ci) = sl.win(i as usize).unwrap();
+        assert_eq!((g, ci), best);
+        let e = sl.get(i as usize);
+        assert_eq!((e.uh, e.ts, e.pc, e.off), (g as u64 * 3, g * 5, g * 7, g * 11));
     }
 }
