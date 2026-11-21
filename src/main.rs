@@ -88,7 +88,7 @@ const PB: u32 = 10; // partition bits
 const P: usize = 1 << PB; // partitions, picked by the top PB bits of a hash
 const BAD: u32 = u32::MAX;
 const CHUNK: usize = 8 << 20;
-const _: () = assert!(std::mem::size_of::<Ev>() == 40);
+const _: () = assert!(std::mem::size_of::<Ev>() == 32);
 
 #[derive(Default)]
 struct IdH(u64);
@@ -152,7 +152,7 @@ const PF: usize = 16; // prefetch distance in rows
 thread_local! {
     static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
-    static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<Ev>)> = Default::default();
+    static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<Ev>, Vec<u16>)> = Default::default(); // + chunk of each row
 }
 
 #[inline(always)]
@@ -497,13 +497,24 @@ fn price(s: &[u8]) -> Option<u32> {
 /// Event as parsed: ts is ms after window_start, BAD if the event fails validation.
 #[derive(Clone, Copy, Default)]
 struct Ev {
-    // 40 B: Wc streams 8 rows as 5 whole cache lines
+    // 32 B: Wc streams 8 rows as 4 whole cache lines
     eid: u64,
-    loc: u64, // user_id
-    uh: u64,  // hash of user_id, taken while the line is still in cache
+    uh: u64, // hash of user_id, taken while the line is still in cache
     ts: u32,
     ingest: u32, // seconds after window_start - 40 days
     pc: u32,     // price (0 unless a purchase) | category << 24
+    off: u32,    // user_id: offset in its chunk << 8 | len (255 = longer, find the end again)
+}
+
+/// Back from a chunk-relative user_id to a loc.
+#[inline]
+fn uloc(d: &'static [u8], off: u32) -> u64 {
+    let s = (off >> 8) as usize;
+    let mut n = (off & 255) as usize;
+    if n == 255 {
+        n = d[s..].iter().position(|&c| c == b',' || c == b'"').unwrap(); // the field holds neither
+    }
+    loc(&d[s..s + n])
 }
 
 /// Valid, deduped event, keyed by person.
@@ -633,13 +644,13 @@ impl<T: Copy + Default> Wc<T> {
 }
 
 #[inline(always)]
-fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
+fn event(f: &[&'static [u8]; 7], cx: &Ctx, base: *const u8) -> Option<Ev> {
     if f[0].is_empty() {
         return None;
     }
     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
     let eid = hash(f[0]);
-    let mut e = Ev { eid, loc: 0, uh: 0, ts: BAD, ingest: (ingest.saturating_sub(cx.ws - 40 * DAY) / 1000).clamp(0, u32::MAX as i64) as u32, pc: 0 };
+    let mut e = Ev { eid, off: 0, uh: 0, ts: BAD, ingest: (ingest.saturating_sub(cx.ws - 40 * DAY) / 1000).clamp(0, u32::MAX as i64) as u32, pc: 0 };
     if let Some(ts) = parse_ts(f[2]) {
         if !f[1].is_empty() && ts >= cx.ws && ts < cx.we && !f[5].is_empty() && ingest.saturating_sub(ts) <= DAY {
             let ok = match f[4] {
@@ -655,7 +666,7 @@ fn event(f: &[&'static [u8]; 7], cx: &Ctx) -> Option<Ev> {
             };
             if ok {
                 e.ts = (ts - cx.ws) as u32;
-                e.loc = loc(f[1]);
+                e.off = ((f[1].as_ptr() as usize - base as usize) << 8 | f[1].len().min(255)) as u32;
                 e.uh = hash(f[1]);
             }
         }
@@ -840,18 +851,19 @@ fn main() {
     }
     // 1: events by event_id partition, in parallel with links
     let lp = pairs(&csvs(&data.join("links")));
+    let ech = chunks(&csvs(&data.join("events")));
     let ((pmap, names), s1) = rayon::join(
         || person_tab(lp),
         || {
-            chunks(&csvs(&data.join("events")))
-                .par_iter()
+            ech.par_iter()
                 .map(|&(d, h)| {
+                    assert!(d.len() < 1 << 24, "chunk too long for 24-bit user_id offsets");
                     let mut b = Bk::new(d.len() / 70);
                     WC.with_borrow_mut(|w| {
                         let w = w.get_or_insert_with(Wc::new);
                         w.t.fill(0);
                         scan::<7>(d, h, |f| {
-                            if let Some(e) = event(f, &cx) {
+                            if let Some(e) = event(f, &cx, d.as_ptr()) {
                                 w.push(&mut b, (e.eid >> (64 - PB)) as usize, e);
                             }
                         });
@@ -907,7 +919,7 @@ fn main() {
                     let mut b = Bk::new(ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum());
                     let mut w = Wc::new();
                     for p in ps {
-                    SCRATCH.with_borrow_mut(|(tab, best)| {
+                    SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
                     let cap = (n * 2).next_power_of_two().max(16);
                     // reused per thread: no fresh mmap, page faults and munmap for every partition
@@ -920,8 +932,9 @@ fn main() {
                     tab.resize(cap, u32::MAX);
                     best.clear();
                     best.reserve(n);
+                    bc.clear();
                     let mut ahead = s1.iter().flat_map(|c| c.get(p)).flatten().skip(PF);
-                    for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
+                    for (ci, e) in s1.iter().enumerate().flat_map(|(ci, c)| c.get(p).into_iter().flatten().map(move |e| (ci as u16, e))) {
                         if let Some(a) = ahead.next() {
                             use std::arch::x86_64::*;
                             unsafe { _mm_prefetch(tab.as_ptr().add(a.eid as usize & (cap - 1)) as *const i8, _MM_HINT_T0) }
@@ -932,12 +945,14 @@ fn main() {
                             if t == u32::MAX {
                                 tab[h] = tag | best.len() as u32;
                                 best.push(*e);
+                                bc.push(ci);
                                 break;
                             }
                             if t & !rmask == tag && best[(t & rmask) as usize].eid == e.eid {
                                 let b = &mut best[(t & rmask) as usize];
                                 if e.ingest < b.ingest {
                                     *b = *e;
+                                    bc[(t & rmask) as usize] = ci;
                                 }
                                 break;
                             }
@@ -961,7 +976,7 @@ fn main() {
                             continue;
                         }
                         let q = person(u);
-                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: e.loc, ts: e.ts, pc: e.pc });
+                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
                     }
                     });
                     }
