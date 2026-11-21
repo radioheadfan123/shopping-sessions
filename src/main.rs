@@ -966,6 +966,11 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
     (idx, names)
 }
 
+/// rayon::join, or one after the other with SEQJ set (PROF: each side's own time)
+fn seqjoin<A: FnOnce() -> RA + Send, B: FnOnce() -> RB + Send, RA: Send, RB: Send>(a: A, b: B) -> (RA, RB) {
+    if std::env::var("SEQJ").is_ok() { (a(), b()) } else { rayon::join(a, b) }
+}
+
 fn main() {
     let t0 = std::time::Instant::now();
     let lap = |what: &str| if std::env::var("PROF").is_ok() { { let mut r: libc::rusage = unsafe { std::mem::zeroed() }; unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }; let cpu = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3; eprintln!("{:>7.1} ms {what} cpu {:.0}+{:.0} flt {}", t0.elapsed().as_secs_f64() * 1e3, cpu(r.ru_utime), cpu(r.ru_stime), r.ru_minflt) } };
@@ -1474,7 +1479,7 @@ fn main() {
         let off: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, j| { *a += s1.iter().map(|c| c.len(j)).sum::<usize>(); Some(*a) })).collect();
         let mut fbuf: Vec<Ev2> = Vec::with_capacity(off[P]);
         let fb = fbuf.as_mut_ptr() as usize;
-        let (cl, pa) = rayon::join(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
+        let (cl, pa) = seqjoin(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
             let r = (0..P)
                 .into_par_iter()
                 .map(|j| {
