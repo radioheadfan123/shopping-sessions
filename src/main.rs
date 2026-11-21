@@ -697,7 +697,11 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
         }
         x
     }
-    for pr in &pairs {
+    for (i, pr) in pairs.iter().enumerate() {
+        if let Some(n) = pairs.get(i + PF) {
+            idx.prefetch(n[0].1);
+            idx.prefetch(n[1].1);
+        }
         let mut id = |(l, h): (u64, u64)| match idx.get(h) {
             Some(i) => i as u32,
             None => {
@@ -727,6 +731,9 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
     let mut pmap = Tab::new(n);
     let mut names: Map<u64> = Map::with_capacity_and_hasher(n / 2, Default::default());
     for x in 0..n {
+        if let Some(a) = ids.get(x + PF) {
+            pmap.prefetch(a.1);
+        }
         let r = find(&mut parent, x as u32) as usize;
         let (name, key) = ids[best[r] as usize];
         pmap.insert(ids[x].1, key);
