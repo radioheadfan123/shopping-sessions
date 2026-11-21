@@ -235,7 +235,7 @@ fn csvs(dir: &Path) -> Vec<&'static [u8]> {
 /// Pieces of about CHUNK bytes ending on a line break; the bool says "starts the file" (skip the header).
 fn chunks(files: &[&'static [u8]]) -> Vec<(&'static [u8], bool)> {
     let mut out = vec![];
-    let chunk = kn("CH", 8) << 20;
+    let chunk = kn("CH", 15) << 20;
     for &d in files {
         let mut s = 0;
         while s < d.len() {
@@ -572,8 +572,8 @@ struct Bk<T> {
 impl<T: Copy> Bk<T> {
     fn new(n: usize) -> Self {
         let sz = std::mem::size_of::<T>();
-        let mut cap = (n / P + n / P / kn("HR", 4) + kn("PAD", 16)).next_multiple_of(8); // 8 rows: whole lines, for streaming
-        if kn("FILL", 0) == 1 {
+        let mut cap = (n / P + n / P / kn("HR", 16) + kn("PAD", 8)).next_multiple_of(8); // 8 rows: whole lines, for streaming
+        if kn("FILL", 1) == 1 {
             cap = ((cap * P * sz).next_multiple_of(BIG) / (P * sz)) & !7; // the block is zeroed anyway: use it all
         }
         Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
