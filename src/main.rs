@@ -1001,6 +1001,8 @@ fn main() {
         },
     );
     lap("written");
+    // files are closed; skip freeing gigabytes of buffers one by one, the kernel drops it all at once
+    unsafe { libc::_exit(0) }
 }
 
 /// Partition q of every chunk, ordered by key: one counting pass on the person bits under the
