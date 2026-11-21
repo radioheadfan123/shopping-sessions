@@ -529,26 +529,50 @@ fn window(json: &str, key: &str) -> i64 {
 }
 
 /// P partitions of about n rows in total, in one block so the allocator can hand it out as huge,
-/// pre-faulted pages; a full partition spills into its own Vec.
+/// pre-faulted pages; a full partition spills into its own Vec. Rows are staged WC per partition
+/// in a small buffer that stays in cache and copied out a run at a time (512 scattered streams
+/// over a 6 MB block otherwise miss on every store); call fin() before reading.
+const WC: usize = 8;
 struct Bk<T> {
     v: Vec<T>,
     n: Vec<u32>,
     cap: usize,
     spill: Vec<Vec<T>>,
+    w: Vec<T>,
+    wn: Vec<u8>,
 }
 impl<T: Copy> Bk<T> {
     fn new(n: usize) -> Self {
         let cap = n / P + n / P / 8 + 16; // ~2.5 sd over the mean at 8 MB chunks; the rare full partition spills
-        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect() }
+        Bk { v: Vec::with_capacity(cap * P), n: vec![0; P], cap, spill: (0..P).map(|_| vec![]).collect(), w: Vec::with_capacity(P * WC), wn: vec![0; P] }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
-        let k = self.n[b] as usize;
-        if k < self.cap {
-            unsafe { self.v.as_mut_ptr().add(b * self.cap + k).write(x) };
-            self.n[b] += 1;
+        let i = self.wn[b] as usize;
+        unsafe { self.w.as_mut_ptr().add(b * WC + i).write(x) };
+        if i == WC - 1 {
+            self.wn[b] = 0;
+            self.flush(b, WC);
         } else {
-            self.spill[b].push(x);
+            self.wn[b] = i as u8 + 1;
+        }
+    }
+    #[inline(always)]
+    fn flush(&mut self, b: usize, m: usize) {
+        let k = self.n[b] as usize;
+        let src = unsafe { self.w.as_ptr().add(b * WC) };
+        if k + m <= self.cap && self.spill[b].is_empty() { // once spilled, stay spilled: rows keep their order
+            unsafe { std::ptr::copy_nonoverlapping(src, self.v.as_mut_ptr().add(b * self.cap + k), m) };
+            self.n[b] += m as u32;
+        } else {
+            self.spill[b].extend_from_slice(unsafe { std::slice::from_raw_parts(src, m) });
+        }
+    }
+    fn fin(&mut self) {
+        for b in 0..P {
+            let m = self.wn[b] as usize;
+            self.wn[b] = 0;
+            self.flush(b, m);
         }
     }
     fn get(&self, b: usize) -> [&[T]; 2] {
@@ -743,6 +767,7 @@ fn main() {
                     pop(d);
                     let mut b = Bk::new(d.len() / 70);
                     scan::<7>(d, h, |f| parse_event(f, &cx, &mut b));
+                    b.fin();
                     b
                 })
                 .collect::<Vec<_>>()
@@ -779,6 +804,7 @@ fn main() {
                         c.person = person(c.person);
                         b.push((c.person >> (64 - PB)) as usize, c);
                     }
+                    b.fin();
                     b
                 })
                 .collect::<Vec<_>>()
@@ -844,6 +870,7 @@ fn main() {
                     }
                     });
                     }
+                    b.fin();
                     b
                 })
                 .collect::<Vec<_>>()
