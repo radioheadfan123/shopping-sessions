@@ -1071,13 +1071,33 @@ fn main() {
                 .collect::<Vec<_>>()
         },
         || {
+            // person-partition histogram from 8 eid partitions (a random ~0.8% of events), to size each job's buckets:
+            // whale persons overflow even-sized buckets into growing Vecs
+            const SP: usize = 8;
+            let hs = (0..SP)
+                .into_par_iter()
+                .map(|p| {
+                    let mut h = vec![0u32; P];
+                    for e in s1.iter().flat_map(|c| c.get(p)).flatten() {
+                        h[(person(e.uh) >> (64 - PB)) as usize] += 1;
+                    }
+                    h
+                })
+                .reduce(|| vec![0u32; P], |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                    a
+                });
+            let hn: usize = (0..SP).map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum::<usize>().max(1);
             // 32 jobs of P / 32 partitions, each filling one output: one bucket set per job, not per partition
             (0..32)
                 .into_par_iter()
                 .map(|k| {
                     let ps = k * P / 32..(k + 1) * P / 32;
                     let n: usize = ps.clone().map(|p| s1.iter().map(|c| c.len(p)).sum::<usize>()).sum();
-                    let (mut st, mut sb, mut cnt) = (Vec::with_capacity(n), Vec::with_capacity(n), vec![0u32; P]);
+                    let f = n as f64 / hn as f64;
+                    let cnt: Vec<u32> = hs.iter().map(|&h| (h as f64 * f * 1.25) as u32 + 32).collect();
+                    let mut b = Bk::exact(&cnt);
+                    let mut w = Wc::new();
                     for p in ps {
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                     let n: usize = s1.iter().map(|c| c.len(p)).sum();
@@ -1136,18 +1156,9 @@ fn main() {
                             continue;
                         }
                         let q = person(u);
-                        let pb = (q >> (64 - PB)) as usize;
-                        cnt[pb] += 1;
-                        st.push(Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
-                        sb.push(pb as u16);
+                        w.push(&mut b, (q >> (64 - PB)) as usize, Ev2 { person: q, loc: uloc(ech[bc[i] as usize].0, e.off), ts: e.ts, pc: e.pc });
                     }
                     });
-                    }
-                    // staged, then placed at exact sizes: whale persons would overflow fixed buckets
-                    let mut b = Bk::exact(&cnt);
-                    let mut w = Wc::new();
-                    for (e, &pb) in st.iter().zip(&sb) {
-                        w.push(&mut b, pb as usize, *e);
                     }
                     w.finish(&mut b);
                     b
