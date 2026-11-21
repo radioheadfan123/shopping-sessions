@@ -315,7 +315,7 @@ fn masks(b: &[u8; 64]) -> (u64, u64, u64) {
 /// Stage 1 lists every ',' / '\n' of a 16 KB window with the quote count before it, branch-free;
 /// stage 2 walks that list a whole line at a time.
 #[inline(always)]
-fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
+fn scan_old<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
     const W: usize = 16 << 10;
     assert!(d.len() < u32::MAX as usize - 128);
     let mut e: Vec<(u32, u32)> = Vec::with_capacity(W + 128); // (offset, quotes before it)
@@ -382,6 +382,78 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
             k += j + 1;
         }
         e.drain(..k);
+    }
+}
+
+/// Same contract as scan_old, one pass, no entry list: fields come straight off the separator mask.
+/// A quote anywhere but at a field's first or last byte marks the line "odd", and odd lines go to
+/// split() (exact); the rest need only a 2-byte quote check per field.
+#[inline(always)]
+#[allow(unused_assignments)]
+fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
+    let len = d.len();
+    let mut fl: [&'static [u8]; N] = [&[]; N];
+    let (mut k, mut good, mut odd, mut skip) = (0usize, true, false, header);
+    let (mut s, mut ls, mut base, mut carry) = (0usize, 0usize, 0usize, 1u64); // d starts a field
+    macro_rules! field {
+        ($p:expr) => {{
+            let p = $p;
+            if k < N {
+                let x = unsafe { d.get_unchecked(s..p) };
+                let (q0, q1) = (x.first() == Some(&b'"'), x.last() == Some(&b'"'));
+                good &= q0 == q1 && (!q0 || x.len() >= 2);
+                fl[k] = if q0 && x.len() >= 2 { unsafe { x.get_unchecked(1..x.len() - 1) } } else { x };
+            }
+            k += 1;
+            s = p + 1;
+        }};
+    }
+    macro_rules! eol {
+        ($p:expr) => {{
+            if !skip {
+                if odd {
+                    if split(&d[ls..$p], &mut fl) {
+                        f(&fl);
+                    }
+                } else if k == N && good {
+                    f(&fl);
+                }
+            }
+            (skip, k, good, odd, ls) = (false, 0, true, false, $p + 1);
+        }};
+    }
+    while base < len {
+        let mut tmp = [0u8; 64];
+        let blk: &[u8; 64] = if len - base >= 64 {
+            d[base..base + 64].try_into().unwrap()
+        } else {
+            tmp[..len - base].copy_from_slice(&d[base..]);
+            tmp[len - base] = b'\n'; // ends a last line with no break; else an empty line, dropped
+            &tmp
+        };
+        let (cm, nm, qm) = masks(blk);
+        let sep = cm | nm;
+        let next = (base + 64 >= len || matches!(d[base + 64], b',' | b'\n')) as u64;
+        let mut bad = qm & !(sep << 1 | carry | sep >> 1 | next << 63); // quotes off a field edge
+        carry = sep >> 63;
+        let mut b = sep;
+        while b != 0 {
+            let tz = b.trailing_zeros();
+            field!(base + tz as usize);
+            if nm >> tz & 1 != 0 {
+                let upto = b ^ b.wrapping_sub(1);
+                odd |= bad & upto != 0;
+                bad &= !upto;
+                eol!(base + tz as usize);
+            }
+            b &= b.wrapping_sub(1);
+        }
+        odd |= bad != 0;
+        base += 64;
+    }
+    if len % 64 == 0 && len > 0 && d[len - 1] != b'\n' {
+        field!(len);
+        eol!(len);
     }
 }
 
@@ -859,6 +931,30 @@ fn main() {
         return;
     }
     // 1: events by event_id partition, in parallel with links
+    if std::env::var("SCANCHECK").is_ok() {
+        // scan() must yield exactly what lines() + split() yield, on every input file
+        fn check<const N: usize>(files: &[&'static [u8]]) -> usize {
+            let mut n = 0;
+            for &(d, h) in &chunks(files) {
+                let (mut a, mut b): (Vec<[&[u8]; N]>, Vec<[&[u8]; N]>) = (vec![], vec![]);
+                scan::<N>(d, h, |f| a.push(*f));
+                lines(d, h, |l| {
+                    let mut f: [&'static [u8]; N] = [&[]; N];
+                    if split(l, &mut f) {
+                        b.push(f);
+                    }
+                });
+                assert!(a == b, "scan differs from split");
+                n += a.len();
+            }
+            n
+        }
+        let e = check::<7>(&csvs(&data.join("events")));
+        let c = check::<4>(&csvs(&data.join("clicks")));
+        let l = check::<2>(&csvs(&data.join("links")));
+        eprintln!("scan ok: {e} events, {c} clicks, {l} links");
+        return;
+    }
     if let Ok(m) = std::env::var("ONLY") {
         // diag: 1 = scan only, 2 = scan + event(), 3 = full phase 1 without persons
         let ech = chunks(&csvs(&data.join("events")));
