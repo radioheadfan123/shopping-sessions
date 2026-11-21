@@ -36,7 +36,7 @@ unsafe impl std::alloc::GlobalAlloc for Big {
                 return 0;
             }
             let a = (p as usize).next_multiple_of(BIG);
-            libc::madvise(a as *mut libc::c_void, ARENA_SZ, libc::MADV_HUGEPAGE);
+            libc::madvise(a as *mut libc::c_void, ARENA_SZ, if std::env::var("HP").is_ok_and(|v| v == "0") { libc::MADV_NOHUGEPAGE } else { libc::MADV_HUGEPAGE });
             a
         });
         if base != 0 {
