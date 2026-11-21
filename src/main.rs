@@ -1486,41 +1486,30 @@ fn main() {
                     let (mut nf, mut sl, mut nr) = (0usize, vec![], 0usize); // fast survivors (index order), slow ones, runs
                     let fp = unsafe { (fb as *mut Ev2).add(off[j]) };
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
-                        best.clear();
-                        bc.clear();
                         let rows = s1.iter().enumerate().flat_map(|(ci, c)| c.get(j).into_iter().flatten().map(move |e| (ci as u16, e)));
-                        let mut keep = |t: Option<u32>, ci: u16, e: &Ev| -> Option<u32> {
-                            match t {
-                                None => {
-                                    best.push(*e);
-                                    bc.push(ci);
-                                    Some(best.len() as u32 - 1)
-                                }
-                                Some(t) => {
-                                    if e.ingest < best[t as usize].ingest {
-                                        best[t as usize] = *e; // ties keep the first seen
-                                        bc[t as usize] = ci;
-                                    }
-                                    None
-                                }
-                            }
-                        };
                         if j < P - 1 {
-                            tab.clear();
+                            // one slot per index holds the row itself (eid MAX = empty): no row list, no gather
                             let base = j as u64 * cx.ew;
-                            tab.resize(if j == P - 2 { cx.eb.saturating_sub(base) } else { cx.ew } as usize, u32::MAX);
+                            let w = if j == P - 2 { cx.eb.saturating_sub(base) } else { cx.ew } as usize;
+                            let _ = &tab;
+                            best.clear();
+                            best.resize(w, Ev { eid: u64::MAX, ..Default::default() });
+                            if bc.len() < w {
+                                bc.resize(w, 0); // read only where a row was written
+                            }
                             for (ci, e) in rows {
                                 let k = (e.eid - base) as usize;
-                                if let Some(n) = keep((tab[k] != u32::MAX).then_some(tab[k]), ci, e) {
-                                    tab[k] = n;
+                                let s = &mut best[k];
+                                if s.eid != e.eid || e.ingest < s.ingest {
+                                    *s = *e; // ties keep the first seen
+                                    bc[k] = ci;
                                 }
                             }
                             let mut last = u64::MAX;
-                            for &t in tab.iter() {
-                                if t == u32::MAX || best[t as usize].ts == BAD {
+                            for (k, e) in best.iter().enumerate() {
+                                if e.eid == u64::MAX || e.ts == BAD {
                                     continue;
                                 }
-                                let e = &best[t as usize];
                                 match fastv(e) {
                                     Some(v) => {
                                         if v >> 9 != last {
@@ -1532,13 +1521,31 @@ fn main() {
                                         nf += 1;
                                     }
                                     None => {
-                                        let (q, l) = ekey(e, bc[t as usize] as usize);
+                                        let (q, l) = ekey(e, bc[k] as usize);
                                         sl.push(Ev2 { person: q, loc: l, ts: e.ts, pc: e.pc });
                                     }
                                 }
                             }
                         } else {
                             // IDs that do not decode: hash dedup; a fast person met here is never clean
+                            best.clear();
+                            bc.clear();
+                            let mut keep = |t: Option<u32>, ci: u16, e: &Ev| -> Option<u32> {
+                                match t {
+                                    None => {
+                                        best.push(*e);
+                                        bc.push(ci);
+                                        Some(best.len() as u32 - 1)
+                                    }
+                                    Some(t) => {
+                                        if e.ingest < best[t as usize].ingest {
+                                            best[t as usize] = *e; // ties keep the first seen
+                                            bc[t as usize] = ci;
+                                        }
+                                        None
+                                    }
+                                }
+                            };
                             let mut m: Map<u32> = Map::default();
                             for (ci, e) in rows {
                                 let t = m.get(&e.eid).copied();
