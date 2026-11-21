@@ -1559,8 +1559,9 @@ fn main() {
         let cs: Vec<Vec<Cl>> = (0..P)
             .into_par_iter()
             .map(|q| {
-                let mut v = vec![];
-                group(&cl, q, |c| (c.person, c.ts), &mut v);
+                // not group(): its radix step assumes keys share their top bits, and person-number partitions do not
+                let mut v: Vec<Cl> = cl.iter().flat_map(|c| c.get(q)).flatten().copied().collect();
+                v.sort_unstable_by_key(|c| (c.person, c.ts));
                 v
             })
             .collect();
