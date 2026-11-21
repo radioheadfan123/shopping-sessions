@@ -147,7 +147,7 @@ fn r8(s: &[u8], i: usize) -> u64 {
 
 /// 64-bit string hash (wyhash's short-input path). ponytail: 64 bits, so ~1e-4 odds of one event_id
 /// collision at 60M events; 128 bits if that ever bites.
-#[inline]
+#[inline(always)]
 fn hash(s: &[u8]) -> u64 {
     const S0: u64 = 0xa076_1d64_78bd_642f;
     const S1: u64 = 0xe703_7ed1_a0b4_28db;
@@ -362,7 +362,7 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
     }
 }
 
-#[inline]
+#[inline(always)]
 fn d2(b: &[u8], i: usize) -> Option<i64> {
     let (a, c) = (b[i].wrapping_sub(b'0'), b[i + 1].wrapping_sub(b'0'));
     (a < 10 && c < 10).then_some((a * 10 + c) as i64)
@@ -377,12 +377,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// F1 / F2 / F3 timestamp -> epoch ms; None if bad.
-#[inline]
+#[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
     if (s.len() == 20 || s.len() == 25) && s[4] == b'-' { iso(s) } else { epoch(s) }
 }
 
-#[inline]
+#[inline(always)]
 fn epoch(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
@@ -408,7 +408,7 @@ fn epoch(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
-#[inline]
+#[inline(always)]
 fn iso(s: &[u8]) -> Option<i64> {
     // bytes 0..16 XOR the template: digit lanes must come out 0..9 and separator lanes 0, so
     // adding 0x76 (digit) or 0x7f (separator) to the low 7 bits sets a lane's top bit when it is bad
@@ -457,7 +457,7 @@ fn iso(s: &[u8]) -> Option<i64> {
     Some(t * 1000)
 }
 
-#[inline]
+#[inline(always)]
 fn price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
         return None;
