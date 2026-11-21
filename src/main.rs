@@ -996,8 +996,11 @@ fn main() {
     let step = |mut st: St, q: usize| -> St {
             {
                 let (mut ev, mut ck) = (std::mem::take(&mut st.ev), std::mem::take(&mut st.ck));
+                let t0 = std::time::Instant::now();
                 group(&s2, q, |e| (e.person, e.ts), &mut ev);
                 group(&cl, q, |c| (c.person, c.ts), &mut ck);
+                TG.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                let _g = Tm(std::time::Instant::now(), &TL);
                 let (mut i, mut ci) = (0, 0);
                 while i < ev.len() {
                     let pk = ev[i].person;
@@ -1098,12 +1101,14 @@ fn main() {
                 st = step(st, q);
             }
             if k == 0 || !st.rows.is_empty() {
+                let _g = Tm(std::time::Instant::now(), &TW);
                 write_user(&ud.join(format!("part-{k}.parquet")), &st.rows, &catnames, base_day);
             }
             st.camp
         })
         .collect();
 
+    eprintln!("  group {} loop {} write {} ms (thread sums)", TG.load(std::sync::atomic::Ordering::Relaxed)/1000000, TL.load(std::sync::atomic::Ordering::Relaxed)/1000000, TW.load(std::sync::atomic::Ordering::Relaxed)/1000000);
     lap("sessions");
     // 4: write
     let mut camp = vec![[0i64; 4]; (ncamp + 1) * ndays];
@@ -1225,4 +1230,14 @@ fn write_camp(path: &Path, rows: &[(&[u8], &[u8], i32, [i64; 4])]) {
     }
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+static TG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+struct Tm(std::time::Instant, &'static std::sync::atomic::AtomicU64);
+impl Drop for Tm {
+    fn drop(&mut self) {
+        self.1.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 }
