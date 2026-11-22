@@ -1067,7 +1067,30 @@ fn main() {
         libc::mallopt(libc::M_MMAP_THRESHOLD, BIG as i32);
         libc::mallopt(libc::M_TRIM_THRESHOLD, i32::MAX);
     }
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
+    // each worker on its own CPU of the allowed set (cores first, then their hyperthreads, as the
+    // kernel numbers them), with node-local memory: no migrations mid-phase, no remote pages
+    let cpus: Vec<usize> = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+        (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+    };
+    let pin = std::env::var("NOPIN").is_err() && cpus.len() >= ncpu.max(1);
+    let local = || unsafe { libc::syscall(libc::SYS_set_mempolicy, 4 /* MPOL_LOCAL */, std::ptr::null::<u64>(), 0u64) };
+    local();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(ncpu)
+        .start_handler(move |i| {
+            local();
+            if pin {
+                unsafe {
+                    let mut set: libc::cpu_set_t = std::mem::zeroed();
+                    libc::CPU_SET(cpus[i % cpus.len()], &mut set);
+                    libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                }
+            }
+        })
+        .build_global()
+        .unwrap();
 
     let man = std::fs::read_to_string(data.join("manifest.json")).unwrap();
     let (ws, we) = (window(&man, "\"window_start\""), window(&man, "\"window_end\""));
