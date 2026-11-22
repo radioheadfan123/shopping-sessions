@@ -177,6 +177,8 @@ thread_local! {
     static WC: std::cell::RefCell<Option<Wc<Ev>>> = const { std::cell::RefCell::new(None) };
     /// Event dedup scratch (hash table, winning rows), kept per thread across partitions.
     static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<Ev>, Vec<u16>)> = Default::default(); // + chunk of each row
+    /// Click placement scratch (placed clicks, index slots), kept per thread across partitions.
+    static CSCR: std::cell::RefCell<(Vec<Cl>, Vec<u32>)> = Default::default();
 }
 
 #[inline(always)]
@@ -645,6 +647,24 @@ struct Ev2 {
     pc: u32, // as in Ev
 }
 
+/// A person's clicks, by ts: keyed ones (c, by (key, ts)), plus placed ones (d, by (v, ts)) for a fast
+/// person; merged into buf only when the person has both.
+fn clicks<'a>((c, d): (&'a [Cl], &'a [Cl]), key: u64, fv: Option<u64>, buf: &'a mut Vec<Cl>) -> &'a [Cl] {
+    let a = c.partition_point(|x| x.person < key);
+    let c = &c[a..a + c[a..].partition_point(|x| x.person == key)];
+    let Some(fv) = fv.filter(|_| !d.is_empty()) else { return c };
+    let x = d.partition_point(|x| x.person < fv);
+    let d = &d[x..x + d[x..].partition_point(|x| x.person == fv)];
+    if c.is_empty() || d.is_empty() {
+        return if c.is_empty() { d } else { c };
+    }
+    buf.clear();
+    buf.extend_from_slice(c);
+    buf.extend_from_slice(d);
+    buf.sort_unstable_by_key(|c| c.ts);
+    buf
+}
+const CIDX: u32 = 1 << 31; // in Cl.camp while parsing: person holds index << vb | v
 #[derive(Clone, Copy, Default)]
 struct Cl {
     person: u64,
@@ -673,6 +693,9 @@ struct Ctx {
     ek: Option<u64>, // event key, if recovered: events then go to partitions by index
     eb: u64,         // event indices below this decode fast
     ew: u64,         // index partition = index / ew (the last index partition also takes the rest)
+    ck: Option<u64>, // click key, if recovered: a fast person's decoded clicks are placed by index, not sorted
+    cb: u64,         // click indices below this decode fast
+    vb: u32,         // bits of a fast person's v (person << 9 | label); a placed click packs index << vb | v
 }
 
 fn window(json: &str, key: &str) -> i64 {
@@ -1098,7 +1121,7 @@ fn main() {
     });
     let camps: Map<u32> = campid.iter().enumerate().map(|(i, c)| (hash(c), i as u32)).collect();
     let ncamp = campid.len();
-    let mut cx = Ctx { ws, we, prod, unknown: catidx(b"unknown"), camps, uk: None, nb: 0, ek: None, eb: 0, ew: 1 };
+    let mut cx = Ctx { ws, we, prod, unknown: catidx(b"unknown"), camps, uk: None, nb: 0, ek: None, eb: 0, ew: 1, ck: None, cb: 0, vb: 0 };
     lap("small tables");
 
     if std::env::var("TSCHECK").is_ok() {
@@ -1236,6 +1259,41 @@ fn main() {
                 cx.eb = (mx + mx / 4 + 4096).min(ebv);
                 cx.ew = (mx + mx / 64 + 1).div_ceil((P - 1) as u64).max(1); // fill every index partition
             }
+            // click key: person 0 owns the first click indices, so its sampled clicks anchor the search
+            if kn("CK", 1) == 1 {
+                let crows: Vec<(&'static [u8], &'static [u8])> = chunks(&cf)
+                    .par_iter()
+                    .flat_map_iter(|&(d, h)| {
+                        let mut v = vec![];
+                        let e = d.len().min(64 << 10); // click chunks are few (15 MB each): sample more of each
+                        let e = d[..e].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
+                        lines(&d[..e], h, |l| {
+                            let mut f: [&'static [u8]; 4] = [&[]; 4];
+                            if split(l, &mut f) {
+                                v.push((f[0], f[1]));
+                            }
+                        });
+                        v
+                    })
+                    .collect();
+                let anchors: Vec<&[u8]> = crows.iter().filter(|r| dec::id(r.1, b'u', k).is_some_and(|n| n >> 9 == 0)).map(|r| r.0).take(8).collect();
+                let mut cids: Vec<&[u8]> = crows.iter().map(|r| r.0).collect();
+                cids.sort_unstable();
+                cids.dedup();
+                let cbv = (cf.iter().map(|d| d.len()).sum::<usize>() / 30).max(1 << 16) as u64;
+                cx.ck = dec::click_key(&anchors, &cids, cbv);
+                if let Some(ck) = cx.ck {
+                    let mx = cids.iter().filter_map(|s| dec::id(s, b'k', ck)).filter(|&i| i < cbv).max().unwrap_or(0);
+                    cx.cb = (mx + mx / 4 + 4096).min(cbv);
+                    cx.vb = 64 - (cx.nb << 9).leading_zeros();
+                    if cx.vb + (64 - cx.cb.leading_zeros()) > 64 || cx.ek.is_none() {
+                        cx.ck = None;
+                    }
+                }
+                if std::env::var("DIAG").is_ok() {
+                    eprintln!("DIAG click sample {} anchors {} click key {:?} cb {} vb {}", cids.len(), anchors.len(), cx.ck, cx.cb, cx.vb);
+                }
+            }
         }
         if std::env::var("DIAG").is_ok() {
             eprintln!("DIAG sample {} distinct, user key {:?}, nb {}, vb {vb}, event key {:?} eb {} ew {}", distinct.len(), cx.uk, cx.nb, cx.ek, cx.eb, cx.ew);
@@ -1314,10 +1372,11 @@ fn main() {
         let v = n & !511 | if a < 16 { t >> (4 * a) & 15 } else { a };
         Some((mix(v), v))
     };
-    let ukey = |s: &'static [u8]| -> u64 {
+    // person key of a user_id, and its v if it decodes fast
+    let ukv = |s: &'static [u8]| -> (u64, Option<u64>) {
         match cx.uk.and_then(|k| dec::id(s, b'u', k)).filter(|n| n >> 9 < cx.nb).and_then(fkey) {
-            Some((k, _)) => k,
-            None => person(hash(s)),
+            Some((k, v)) => (k, Some(v)),
+            None => (person(hash(s)), None),
         }
     };
     let ekey = |e: &Ev, ci: usize| -> (u64, u64) {
@@ -1443,6 +1502,7 @@ fn main() {
     };
     // click partition: by key hash, but with an event key a fast person's clicks go by person number,
     // so the clean jobs, which walk persons in that order, look clicks up in a few partitions at a time
+    let vm = (1u64 << cx.vb.min(63)) - 1; // v of a placed click (vb < 64 when a click key is in use)
     let cq = |k: u64| -> usize {
         let p = unmix(k) >> 9;
         if cx.ek.is_some() && p < cx.nb { (p * P as u64 / cx.nb) as usize } else { (k >> (64 - PB)) as usize }
@@ -1463,17 +1523,27 @@ fn main() {
                             return;
                         }
                         let Some(&camp) = cx.camps.get(&hash(f[2])) else { return };
-                        v.push(Cl { person: ukey(f[1]), cid: loc(f[0]), ts: (ts - (ws - WEEK)) as u32, camp });
+                        let ts = (ts - (ws - WEEK)) as u32;
+                        let (k, fv) = ukv(f[1]);
+                        // a fast person's click with a decoding click_id: placed by index later (CIDX marks it)
+                        if let (Some(ck), Some(fv)) = (cx.ck, fv) {
+                            if let Some(i) = dec::id(f[0], b'k', ck).filter(|&i| i < cx.cb) {
+                                v.push(Cl { person: i << cx.vb | fv, cid: loc(f[0]), ts, camp: camp | CIDX });
+                                return;
+                            }
+                        }
+                        v.push(Cl { person: k, cid: loc(f[0]), ts, camp });
                     });
+                    let cp = |c: &Cl| if c.camp & CIDX != 0 { cq(mix(c.person & vm)) } else { cq(c.person) };
                     let mut cnt = vec![0u32; P];
                     for c in &v {
-                        cnt[cq(c.person)] += 1;
+                        cnt[cp(c)] += 1;
                     }
                     // exact sizes: whale persons would overflow fixed buckets into growing Vecs
                     let mut b = Bk::exact(&cnt);
                     let mut w = Wc::new();
                     for c in &v {
-                        w.push(&mut b, cq(c.person), *c);
+                        w.push(&mut b, cp(c), *c);
                     }
                     w.finish(&mut b);
                     b
@@ -1682,23 +1752,86 @@ fn main() {
         let co: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, q| { *a += cl.iter().map(|c| c.len(q)).sum::<usize>(); Some(*a) })).collect();
         let mut cbuf: Vec<Cl> = Vec::with_capacity(co[P]);
         let cb = cbuf.as_mut_ptr() as usize;
-        let cs: Vec<&[Cl]> = (0..P)
+        // each partition: (clicks by (key, ts), placed clicks by (v, ts))
+        let cs: Vec<(&[Cl], &[Cl])> = (0..P)
             .into_par_iter()
             .map(|q| {
                 // not group(): its radix step assumes keys share their top bits, and person-number partitions do not
                 let v = unsafe { std::slice::from_raw_parts_mut((cb as *mut Cl).add(co[q]), co[q + 1] - co[q]) };
-                for (d, s) in v.iter_mut().zip(cl.iter().flat_map(|c| c.get(q)).flatten()) {
-                    *d = *s;
-                }
-                v.sort_unstable_by_key(|c| (c.person, c.ts));
-                &*v
+                CSCR.with_borrow_mut(|(ix, tab)| {
+                    ix.clear();
+                    let mut n0 = 0;
+                    for s in cl.iter().flat_map(|c| c.get(q)).flatten() {
+                        if s.camp & CIDX != 0 {
+                            ix.push(*s);
+                        } else {
+                            v[n0] = *s;
+                            n0 += 1;
+                        }
+                    }
+                    let mut n1 = 0;
+                    if !ix.is_empty() {
+                        // a person's clicks hold consecutive indices: one slot per index puts them in person order with
+                        // no sort. Identical copies of a click (same index, so same click_id, person, ts, campaign) change
+                        // no output and are dropped; a copy that differs, or a spread too wide for slots, goes the keyed way.
+                        let (lo, hi) = ix.iter().fold((u64::MAX, 0), |a, c| (a.0.min(c.person >> cx.vb), a.1.max(c.person >> cx.vb)));
+                        let w = (hi - lo + 1) as usize;
+                        let keyed = |c: &Cl| Cl { person: mix(c.person & vm), camp: c.camp & !CIDX, ..*c };
+                        if w <= 4 * ix.len() + 1024 {
+                            tab.clear();
+                            tab.resize(w, u32::MAX);
+                            for (r, c) in ix.iter().enumerate() {
+                                let t = &mut tab[((c.person >> cx.vb) - lo) as usize];
+                                if *t == u32::MAX {
+                                    *t = r as u32;
+                                } else {
+                                    let o = &ix[*t as usize];
+                                    if (o.person, o.ts, o.camp) != (c.person, c.ts, c.camp) {
+                                        v[n0] = keyed(c);
+                                        n0 += 1;
+                                    }
+                                }
+                            }
+                            let u = &mut v[n0..];
+                            for &t in tab.iter().filter(|&&t| t != u32::MAX) {
+                                let c = &ix[t as usize];
+                                u[n1] = Cl { person: c.person & vm, camp: c.camp & !CIDX, ..*c };
+                                n1 += 1;
+                            }
+                            // index order is person order; within a person, by (v, ts)
+                            let u = &mut u[..n1];
+                            let mut a = 0;
+                            while a < u.len() {
+                                let p = u[a].person >> 9;
+                                let mut b = a + 1;
+                                while b < u.len() && u[b].person >> 9 == p {
+                                    b += 1;
+                                }
+                                if b - a > 1 {
+                                    u[a..b].sort_unstable_by_key(|c| (c.person, c.ts));
+                                }
+                                a = b;
+                            }
+                            if !u.windows(2).all(|x| x[0].person <= x[1].person) {
+                                u.sort_unstable_by_key(|c| (c.person, c.ts)); // persons out of index order: still exact
+                            }
+                        } else {
+                            for c in ix.iter() {
+                                v[n0] = keyed(c);
+                                n0 += 1;
+                            }
+                        }
+                    }
+                    v[..n0].sort_unstable_by_key(|c| (c.person, c.ts));
+                    let (a, b) = v.split_at(n0);
+                    (&*a, &b[..n1])
+                })
             })
             .collect();
-        let clk = |key: u64| -> &[Cl] {
-            let c = &cs[cq(key)];
-            let a = c.partition_point(|x| x.person < key);
-            &c[a..a + c[a..].partition_point(|x| x.person == key)]
-        };
+
+        if std::env::var("DIAG").is_ok() {
+            eprintln!("DIAG clicks keyed {}, placed {}", cs.iter().map(|x| x.0.len()).sum::<usize>(), cs.iter().map(|x| x.1.len()).sum::<usize>());
+        }
         lap("clicks grouped");
         // a person continuing across an index partition edge is one run, not two
         let fp = |j: usize| pa[j].0.first().map(|x| x.person >> 9);
@@ -1717,7 +1850,7 @@ fn main() {
         let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
             .into_par_iter()
             .map(|k| {
-                let (mut st, mut slow, mut tmp) = (new_st(), vec![], vec![]);
+                let (mut st, mut slow, mut tmp, mut cbf) = (new_st(), vec![], vec![], vec![]);
                 let tj = std::time::Instant::now();
                 for j in jb[k]..jb[k + 1].max(jb[k]) {
                     let f = &pa[j].0;
@@ -1768,7 +1901,7 @@ fn main() {
                                 b += 1;
                             }
                             let name = fname(v, &mut st.nbuf);
-                            body(&mut st, &r[a..b], clk(mix(v)), name);
+                            body(&mut st, &r[a..b], clicks(cs[cq(mix(v))], mix(v), Some(v), &mut cbf), name);
                             a = b;
                         }
                     }
@@ -1801,7 +1934,7 @@ fn main() {
         let mut states: Vec<Vec<[i64; 4]>> = (0..32)
             .into_par_iter()
             .map(|k| {
-                let mut st = new_st();
+                let (mut st, mut cbf) = (new_st(), vec![]);
                 let ev = &sv[cut[k]..cut[k + 1].max(cut[k])];
                 let mut i = 0;
                 while i < ev.len() {
@@ -1812,7 +1945,7 @@ fn main() {
                     }
                     let l0 = ev[i].loc;
                     let name = if l0 >> 48 == 0 { fname(l0, &mut st.nbuf) } else { *names.get(&pk).unwrap_or(&l0) };
-                    body(&mut st, &ev[i..j], clk(pk), name);
+                    body(&mut st, &ev[i..j], clicks(cs[cq(pk)], pk, (l0 >> 48 == 0).then_some(l0), &mut cbf), name);
                     i = j;
                 }
                 if !st.rows.is_empty() {

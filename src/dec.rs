@@ -125,6 +125,13 @@ pub fn event_key(early: &[&[u8]], distinct: &[&[u8]], bound: u64) -> Option<u64>
     search(early, b'e', &ns, distinct, |n| n < bound)
 }
 
+/// Click key: person 0 owns the first click indices (in no time order), so any of its sampled clicks
+/// may anchor (n < 2^17); a candidate must decode almost every sampled click_id below `bound`.
+pub fn click_key(anchors: &[&[u8]], distinct: &[&[u8]], bound: u64) -> Option<u64> {
+    let ns: Vec<u64> = (0..1 << 17).collect();
+    search(anchors, b'k', &ns, distinct, |n| n < bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
