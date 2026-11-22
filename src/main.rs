@@ -1610,9 +1610,11 @@ fn main() {
         let mut fbuf: Vec<Ev2> = Vec::with_capacity(off[P]);
         let fb = fbuf.as_mut_ptr() as usize;
         let (cl, pa) = seqjoin(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
-            let r = (0..P)
+            // the hash-dedup partition P - 1 is the longest: start it first, not last
+            let mut r = (0..P)
                 .into_par_iter()
                 .map(|j| {
+                    let j = (j + P - 1) % P;
                     let (mut nf, mut sl, mut nr) = (0usize, vec![], 0usize); // fast survivors (index order), slow ones, runs
                     let fp = unsafe { (fb as *mut Ev2).add(off[j]) };
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
@@ -1688,6 +1690,7 @@ fn main() {
                     (unsafe { std::slice::from_raw_parts(fp as *const Ev2, nf) }, sl, nr)
                 })
                 .collect::<Vec<_>>();
+            r.rotate_left(1);
             lap("  (dedup done)");
             r
         });
