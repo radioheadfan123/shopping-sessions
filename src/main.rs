@@ -316,11 +316,31 @@ fn split(line: &'static [u8], out: &mut [&'static [u8]]) -> bool {
     }
 }
 
-/// Bitmasks of ',' , '\n' and '"' over 64 bytes.
+/// Bitmasks of ',' , '\n' and '"' over 64 bytes. L is the vector level: 5 = AVX-512BW (one load,
+/// three mask compares), 2 = AVX2, else SSE2; callers only use L above 0 inside a function compiled for it.
 #[inline(always)]
-fn masks(b: &[u8; 64]) -> (u64, u64, u64) {
+fn masks<const L: u8>(b: &[u8; 64]) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     unsafe {
+        if L == 5 {
+            let v = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
+            return (
+                _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+                _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+                _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+            );
+        }
+        if L == 2 {
+            let (c, n, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+            let (mut cm, mut nm, mut qm) = (0u64, 0u64, 0u64);
+            for i in 0..2 {
+                let v = _mm256_loadu_si256(b.as_ptr().add(32 * i) as *const __m256i);
+                cm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64) << (32 * i);
+                nm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, n)) as u32 as u64) << (32 * i);
+                qm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) as u32 as u64) << (32 * i);
+            }
+            return (cm, nm, qm);
+        }
         let (c, n, q) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
         let (mut cm, mut nm, mut qm) = (0u64, 0u64, 0u64);
         for i in 0..4 {
@@ -331,6 +351,29 @@ fn masks(b: &[u8; 64]) -> (u64, u64, u64) {
         }
         (cm, nm, qm)
     }
+}
+
+/// scan() at the best vector level this CPU has (checked at run time; the result is the same at every level)
+#[inline(always)]
+fn scan<const N: usize>(d: &'static [u8], header: bool, f: impl FnMut(&[&'static [u8]; N])) {
+    static LVL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let l = *LVL.get_or_init(|| {
+        let has = if std::is_x86_feature_detected!("avx512bw") { 5 } else if std::is_x86_feature_detected!("avx2") { 2 } else { 0 };
+        std::env::var("SCANLVL").ok().and_then(|v| v.parse().ok()).map_or(has, |w: u8| w.min(has)) // SCANLVL=0/2 tests the lower paths
+    });
+    match l {
+        5 => unsafe { scan5(d, header, f) },
+        2 => unsafe { scan2(d, header, f) },
+        _ => scanv::<0, N>(d, header, f),
+    }
+}
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn scan5<const N: usize>(d: &'static [u8], header: bool, f: impl FnMut(&[&'static [u8]; N])) {
+    scanv::<5, N>(d, header, f)
+}
+#[target_feature(enable = "avx2")]
+unsafe fn scan2<const N: usize>(d: &'static [u8], header: bool, f: impl FnMut(&[&'static [u8]; N])) {
+    scanv::<2, N>(d, header, f)
 }
 
 /// Calls f with the unquoted fields of every well-formed line of d (exactly N fields, quotes only
@@ -357,7 +400,7 @@ fn scan_old<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[
                 tmp[d.len() - base] = b'\n'; // harmless if the data already ends with one
                 &tmp
             };
-            let (cm, nm, qm) = masks(blk);
+            let (cm, nm, qm) = masks::<0>(blk);
             let mut b = cm | nm;
             let cnt = b.count_ones() as usize;
             let mut u = 0;
@@ -413,7 +456,7 @@ fn scan_old<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[
 /// split() (exact); the rest need only a 2-byte quote check per field.
 #[inline(always)]
 #[allow(unused_assignments)]
-fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
+fn scanv<const L: u8, const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'static [u8]; N])) {
     let len = d.len();
     let mut fl: [&'static [u8]; N] = [&[]; N];
     let (mut k, mut good, mut odd, mut skip) = (0usize, true, false, header);
@@ -454,7 +497,7 @@ fn scan<const N: usize>(d: &'static [u8], header: bool, mut f: impl FnMut(&[&'st
             tmp[len - base] = b'\n'; // ends a last line with no break; else an empty line, dropped
             &tmp
         };
-        let (cm, nm, qm) = masks(blk);
+        let (cm, nm, qm) = masks::<L>(blk);
         let sep = cm | nm;
         let next = (base + 64 >= len || matches!(d[base + 64], b',' | b'\n')) as u64;
         let mut bad = qm & !(sep << 1 | carry | sep >> 1 | next << 63); // quotes off a field edge
@@ -2071,5 +2114,26 @@ fn slots_race() {
         assert_eq!((g, ci), best);
         let e = sl.get(i as usize);
         assert_eq!((e.uh, e.ts, e.pc, e.off), (g as u64 * 3, g * 5, g * 7, g * 11));
+    }
+}
+
+#[test]
+fn masks_levels_agree() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..20000 {
+        let mut b = [0u8; 64];
+        for c in b.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *c = b",\n\"a"[(x % 4) as usize];
+        }
+        let m0 = masks::<0>(&b);
+        if std::is_x86_feature_detected!("avx2") {
+            assert_eq!(m0, masks::<2>(&b));
+        }
+        if std::is_x86_feature_detected!("avx512bw") {
+            assert_eq!(m0, masks::<5>(&b));
+        }
     }
 }
