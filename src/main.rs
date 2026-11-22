@@ -1723,12 +1723,29 @@ fn main() {
         let cs: Vec<&[Cl]> = (0..P)
             .into_par_iter()
             .map(|q| {
-                // not group(): its radix step assumes keys share their top bits, and person-number partitions do not
+                // counting pass on top key bits (any shift keeps key order), then tiny sorts per bucket.
+                // person-number partitions spread keys over all 64 bits; hash partitions share the top PB
                 let v = unsafe { std::slice::from_raw_parts_mut((cb as *mut Cl).add(co[q]), co[q + 1] - co[q]) };
-                for (d, s) in v.iter_mut().zip(cl.iter().flat_map(|c| c.get(q)).flatten()) {
-                    *d = *s;
+                let bits = (usize::BITS - (v.len() / 8).leading_zeros()).clamp(1, 16);
+                let sh = if cx.ek.is_some() { 64 - bits } else { 64 - PB - bits };
+                let b = |c: &Cl| (c.person >> sh) as usize & ((1 << bits) - 1);
+                let mut at = vec![0u32; (1 << bits) + 1];
+                for c in cl.iter().flat_map(|c| c.get(q)).flatten() {
+                    at[b(c) + 1] += 1;
                 }
-                v.sort_unstable_by_key(|c| (c.person, c.ts));
+                for i in 1..at.len() {
+                    at[i] += at[i - 1];
+                }
+                for c in cl.iter().flat_map(|c| c.get(q)).flatten() {
+                    let k = b(c);
+                    v[at[k] as usize] = *c;
+                    at[k] += 1;
+                }
+                let mut s = 0;
+                for &e in &at[..1 << bits] {
+                    v[s..e as usize].sort_unstable_by_key(|c| (c.person, c.ts));
+                    s = e as usize;
+                }
                 &*v
             })
             .collect();
