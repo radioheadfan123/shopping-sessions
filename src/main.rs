@@ -1625,19 +1625,27 @@ fn main() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         let rc: Vec<AtomicU32> = (0..cx.nb).into_par_iter().map(|_| AtomicU32::new(0)).collect();
         let fastv = |e: &Ev| if e.uh & FAST != 0 { fkey(e.uh & !FAST).map(|r| r.1) } else { None };
-        // fast survivors go to one big buffer (huge pages, no regrowth), each partition to its own exact-size slice
+        // fast survivors are not copied: pass A counts runs, the clean jobs re-read them from the slots
         let slt = slots.as_ref().unwrap();
         // index range of partition j < P - 1
         let rng = |j: usize| (j as u64 * cx.ew).min(cx.eb)..if j == P - 2 { cx.eb } else { ((j as u64 + 1) * cx.ew).min(cx.eb) };
-        let off: Vec<usize> = std::iter::once(0).chain((0..P).scan(0, |a, j| { *a += if j < P - 1 { rng(j).count() } else { 0 }; Some(*a) })).collect();
-        let mut fbuf: Vec<Ev2> = Vec::with_capacity(off[P]);
-        let fb = fbuf.as_mut_ptr() as usize;
+        // fast survivors of partition j < P - 1, in index order
+        let fit = |j: usize| {
+            rng(j).filter_map(move |i| {
+                slt.win(i as usize)?;
+                let e = slt.get(i as usize);
+                if e.ts == BAD {
+                    return None;
+                }
+                fastv(&e).map(|v| Ev2 { person: v, loc: v, ts: e.ts, pc: e.pc })
+            })
+        };
         let (cl, pa) = seqjoin(|| { let r = fc(); lap("  (clicks parse done)"); r }, || {
             let r = (0..P)
                 .into_par_iter()
                 .map(|j| {
-                    let (mut nf, mut sl, mut nr) = (0usize, vec![], 0usize); // fast survivors (index order), slow ones, runs
-                    let fp = unsafe { (fb as *mut Ev2).add(off[j]) };
+                    // fast survivors, slow ones, runs, first and last fast person
+                    let (mut nf, mut sl, mut nr, mut first, mut last) = (0usize, vec![], 0usize, None, u64::MAX);
                     SCRATCH.with_borrow_mut(|(tab, best, bc)| {
                         best.clear();
                         bc.clear();
@@ -1660,7 +1668,6 @@ fn main() {
                         };
                         if j < P - 1 {
                             let _ = tab;
-                            let mut last = u64::MAX;
                             for i in rng(j) {
                                 let Some((_, ci)) = slt.win(i as usize) else { continue };
                                 let e = &slt.get(i as usize);
@@ -1671,10 +1678,10 @@ fn main() {
                                     Some(v) => {
                                         if v >> 9 != last {
                                             last = v >> 9;
+                                            first.get_or_insert(last);
                                             nr += 1;
                                             rc[last as usize].fetch_add(1, Relaxed);
                                         }
-                                        unsafe { fp.add(nf).write(Ev2 { person: v, loc: v, ts: e.ts, pc: e.pc }) };
                                         nf += 1;
                                     }
                                     None => {
@@ -1707,8 +1714,7 @@ fn main() {
                             }
                         }
                     });
-                    // partition j wrote only [off[j], off[j] + nf), and fbuf outlives pa
-                    (unsafe { std::slice::from_raw_parts(fp as *const Ev2, nf) }, sl, nr)
+                    (nf, sl, nr, first, (nf > 0).then_some(last))
                 })
                 .collect::<Vec<_>>();
             lap("  (dedup done)");
@@ -1739,8 +1745,8 @@ fn main() {
         };
         lap("clicks grouped");
         // a person continuing across an index partition edge is one run, not two
-        let fp = |j: usize| pa[j].0.first().map(|x| x.person >> 9);
-        let lp = |j: usize| pa[j].0.last().map(|x| x.person >> 9);
+        let fp = |j: usize| pa[j].3;
+        let lp = |j: usize| pa[j].4;
         for j in 1..P - 1 {
             if let (Some(a), true) = (lp(j - 1), lp(j - 1) == fp(j)) {
                 rc[a as usize].fetch_sub(1, Relaxed);
@@ -1748,7 +1754,7 @@ fn main() {
         }
         // clean runs, 32 jobs over the index partitions; a run crossing edges belongs to the partition it starts in
         // jobs split by estimated cost: low indices hold heavy persons, high ones many light persons
-        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len() + 16 * x.2; Some(*a) })).collect();
+        let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0 + 16 * x.2; Some(*a) })).collect();
         let jb: Vec<usize> = (0..=32).map(|k| if k == 32 { P - 1 } else { cum.partition_point(|&c| c * 32 < k * cum[P - 1]) }).collect();
         lap("job bounds");
         let t32 = std::time::Instant::now();
@@ -1757,47 +1763,42 @@ fn main() {
             .map(|k| {
                 let (mut st, mut slow, mut tmp) = (new_st(), vec![], vec![]);
                 let tj = std::time::Instant::now();
+                let srt = |r: &[Ev2]| r.windows(2).all(|w| w[0].person == w[1].person && w[0].ts <= w[1].ts);
                 for j in jb[k]..jb[k + 1].max(jb[k]) {
-                    let f = &pa[j].0;
-                    let mut i = 0;
-                    while i < f.len() {
-                        let p = f[i].person >> 9;
-                        let mut e = i + 1;
-                        while e < f.len() && f[e].person >> 9 == p {
-                            e += 1;
+                    let mut f = fit(j).peekable();
+                    let mut i = 0; // runs seen in this partition
+                    while let Some(x) = f.next() {
+                        let p = x.person >> 9;
+                        tmp.clear();
+                        tmp.push(x);
+                        while let Some(y) = f.next_if(|y| y.person >> 9 == p) {
+                            tmp.push(y);
                         }
-                        let run = &f[i..e];
                         let start = i > 0 || j == 0 || lp(j - 1) != Some(p);
-                        i = e;
+                        i += 1;
                         if rc[p as usize].load(Relaxed) != 1 {
-                            slow.extend(run.iter().map(|x| Ev2 { person: mix(x.person), ..*x }));
+                            slow.extend(tmp.iter().map(|x| Ev2 { person: mix(x.person), ..*x }));
                             continue;
                         }
                         if !start {
                             continue;
                         }
-                        let srt = |r: &[Ev2]| r.windows(2).all(|w| w[0].person == w[1].person && w[0].ts <= w[1].ts);
-                        let chain = e == f.len() && j + 2 < P && fp(j + 1) == Some(p);
-                        let use_tmp = chain || !srt(run);
-                        if use_tmp {
-                            tmp.clear();
-                            tmp.extend_from_slice(run);
-                            let mut q = j + 1;
-                            while chain && q < P - 1 && fp(q) == Some(p) {
-                                let g = &pa[q].0;
-                                let n = g.iter().position(|x| x.person >> 9 != p).unwrap_or(g.len());
-                                tmp.extend_from_slice(&g[..n]);
-                                if n < g.len() {
-                                    break;
+                        let chain = f.peek().is_none() && j + 2 < P && fp(j + 1) == Some(p);
+                        let mut q = j + 1;
+                        'c: while chain && q < P - 1 && fp(q) == Some(p) {
+                            for y in fit(q) {
+                                if y.person >> 9 != p {
+                                    break 'c;
                                 }
-                                q += 1;
+                                tmp.push(y);
                             }
-                            if !srt(&tmp) {
-                                // aliases with different labels are different persons: group by label, then ts
-                                tmp.sort_unstable_by_key(|x: &Ev2| (x.person, x.ts));
-                            }
+                            q += 1;
                         }
-                        let r: &[Ev2] = if use_tmp { &tmp } else { run };
+                        if !srt(&tmp) {
+                            // aliases with different labels are different persons: group by label, then ts
+                            tmp.sort_unstable_by_key(|x: &Ev2| (x.person, x.ts));
+                        }
+                        let r: &[Ev2] = &tmp;
                         let mut a = 0;
                         while a < r.len() {
                             let v = r[a].person;
@@ -1860,7 +1861,7 @@ fn main() {
             })
             .collect();
         if std::env::var("DIAG").is_ok() {
-            eprintln!("DIAG fast events {}, slow events {}", pa.iter().map(|x| x.0.len()).sum::<usize>(), sv.len());
+            eprintln!("DIAG fast events {}, slow events {}", pa.iter().map(|x| x.0).sum::<usize>(), sv.len());
         }
         states.extend(res.into_iter().map(|x| x.0));
         states
