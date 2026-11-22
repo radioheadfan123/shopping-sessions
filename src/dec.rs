@@ -31,6 +31,32 @@ pub fn unscramble(y: u64, key: u64) -> u64 {
 /// Canonical lowercase base 36 (no leading zero, below 2^40), else None.
 #[inline(always)]
 pub fn b36(s: &[u8]) -> Option<u64> {
+    if let Ok(b) = <[u8; 8]>::try_from(s) {
+        return b36x8(u64::from_le_bytes(b)); // ~93% of IDs: a 40-bit value has 8 digits
+    }
+    b36s(s)
+}
+/// 8 digits at once (byte 0 = leading digit): range checks, digit map and a 3-level multiply tree.
+#[inline(always)]
+fn b36x8(x: u64) -> Option<u64> {
+    const L: u64 = 0x0101_0101_0101_0101;
+    const H: u64 = L * 0x80;
+    // bytes below 0x80, so adding up to 0x80 cannot carry: the top bit says byte >= lo (or > hi)
+    let ge = |lo: u64| x.wrapping_add((0x80 - lo) * L) & H;
+    let gt = |hi: u64| x.wrapping_add((0x7f - hi) * L) & H;
+    let let_ = ge(0x61) & !gt(0x7a);
+    let ok = x & H == 0 && ((ge(0x30) & !gt(0x39)) | let_) == H && x & 0xff != b'0' as u64;
+    if !ok {
+        return None;
+    }
+    let d = x - 0x30 * L - (let_ >> 7) * 0x27;
+    let d = (d & 0x00ff_00ff_00ff_00ff) * 36 + (d >> 8 & 0x00ff_00ff_00ff_00ff);
+    let d = (d & 0x0000_ffff_0000_ffff) * 1296 + (d >> 16 & 0x0000_ffff_0000_ffff);
+    let v = (d & 0xffff_ffff) * 1_679_616 + (d >> 32);
+    (v <= M40).then_some(v)
+}
+#[inline(always)]
+fn b36s(s: &[u8]) -> Option<u64> {
     if s.is_empty() || s.len() > 8 || (s[0] == b'0' && s.len() > 1) {
         return None;
     }
@@ -144,6 +170,35 @@ mod tests {
         assert_eq!(b36(b"Ab"), None);
         assert_eq!(b36(b"zzzzzzzz"), None); // above 2^40
         assert_eq!(b36(b"a-"), None);
+    }
+    #[test]
+    fn swar_matches_loop() {
+        let al = b"0123456789abcdefghijklmnopqrstuvwxyz/:`{AZ\x00\x7f\x80\xff";
+        let mut r = 0x9e37_79b9_7f4a_7c15u64;
+        for i in 0..2_000_000u64 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let mut s = [0u8; 8];
+            for (k, c) in s.iter_mut().enumerate() {
+                let q = (r >> (k * 7)) as usize;
+                // mostly valid digits, sometimes a bad byte
+                *c = if q % 16 == 0 { al[36 + (q >> 4) % (al.len() - 36)] } else { al[(q >> 4) % 36] };
+            }
+            if i % 5 == 0 {
+                s[0] = b'0';
+            }
+            assert_eq!(b36x8(u64::from_le_bytes(s)), b36s(&s), "{:?}", s);
+        }
+        for s in [b"zzzzzzzz", b"10000000", b"ffffffff", b"gzzzzzzz", b"h0000000", b"0zzzzzzz", b"aaaaaaaa"] {
+            assert_eq!(b36(s), b36s(s));
+        }
+        for b in 0..=255u8 {
+            let s = [b, b'1', b'2', b'3', b'4', b'5', b'6', b'7'];
+            assert_eq!(b36(&s), b36s(&s));
+            let s = [b'1', b'2', b'3', b'4', b'5', b'6', b'7', b];
+            assert_eq!(b36(&s), b36s(&s));
+        }
     }
     #[test]
     fn keys() {
