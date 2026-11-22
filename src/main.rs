@@ -1746,13 +1746,14 @@ fn main() {
                 rc[a as usize].fetch_sub(1, Relaxed);
             }
         }
-        // clean runs, 32 jobs over the index partitions; a run crossing edges belongs to the partition it starts in
+        // clean runs, NJ jobs over the index partitions; a run crossing edges belongs to the partition it starts in
         // jobs split by estimated cost: low indices hold heavy persons, high ones many light persons
         let cum: Vec<usize> = std::iter::once(0).chain(pa[..P - 1].iter().scan(0, |a, x| { *a += x.0.len() + 16 * x.2; Some(*a) })).collect();
-        let jb: Vec<usize> = (0..=32).map(|k| if k == 32 { P - 1 } else { cum.partition_point(|&c| c * 32 < k * cum[P - 1]) }).collect();
+        const NJ: usize = 64; // 64 beat 32 by ~4% at 60M on 8 threads: smaller jobs pack the tail better
+        let jb: Vec<usize> = (0..=NJ).map(|k| if k == NJ { P - 1 } else { cum.partition_point(|&c| c * NJ < k * cum[P - 1]) }).collect();
         lap("job bounds");
         let t32 = std::time::Instant::now();
-        let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..32)
+        let res: Vec<(Vec<[i64; 4]>, Vec<Ev2>)> = (0..NJ)
             .into_par_iter()
             .map(|k| {
                 let (mut st, mut slow, mut tmp) = (new_st(), vec![], vec![]);
@@ -1854,7 +1855,7 @@ fn main() {
                     i = j;
                 }
                 if !st.rows.is_empty() {
-                    write_user(&ud.join(format!("part-{}.parquet", 32 + k)), &st.rows, &catnames, base_day);
+                    write_user(&ud.join(format!("part-{}.parquet", NJ + k)), &st.rows, &catnames, base_day);
                 }
                 st.camp
             })
