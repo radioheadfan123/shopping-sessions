@@ -1057,9 +1057,9 @@ fn person_tab(pairs: Vec<[(u64, u64); 2]>) -> (Tab, Map<u64>) {
     (idx, names)
 }
 
-/// rayon::join, or one after the other with SEQJ set (PROF: each side's own time)
+/// one after the other by default (clicks parse, then dedup: they fight for memory bandwidth); PARJ=1 restores rayon::join
 fn seqjoin<A: FnOnce() -> RA + Send, B: FnOnce() -> RB + Send, RA: Send, RB: Send>(a: A, b: B) -> (RA, RB) {
-    if std::env::var("SEQJ").is_ok() { (a(), b()) } else { rayon::join(a, b) }
+    if std::env::var("PARJ").is_err() { (a(), b()) } else { rayon::join(a, b) }
 }
 
 fn main() {
