@@ -1613,7 +1613,12 @@ fn main() {
                     for (d, s) in v.iter_mut().zip(cl.iter().flat_map(|c| c.get(q)).flatten()) {
                         *d = *s;
                     }
-                    v.sort_unstable_by_key(|c| (c.person, c.ts));
+                    // low person numbers are heavy (partition 0 held 9% of d20's clicks): sort big ones in parallel
+                    if v.len() > 1 << 16 {
+                        v.par_sort_unstable_by_key(|c| (c.person, c.ts));
+                    } else {
+                        v.sort_unstable_by_key(|c| (c.person, c.ts));
+                    }
                     &*v
                 })
                 .collect();
