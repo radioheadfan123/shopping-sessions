@@ -109,6 +109,12 @@ fn unmix(mut v: u64) -> u64 {
     v = v.wrapping_mul(const { dec::inv(0xbf58_476d_1ce4_e5b9) });
     v ^ v >> 30 ^ v >> 60
 }
+/// PROBE: host counters from /proc/vmstat (compact_stall, thp_fault_fallback)
+fn vmstat() -> [u64; 2] {
+    let s = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    let g = |k: &str| s.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.trim().parse().ok())).unwrap_or(0);
+    [g("compact_stall "), g("thp_fault_fallback ")]
+}
 fn kn(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
@@ -1057,6 +1063,7 @@ fn seqjoin<A: FnOnce() -> RA + Send, B: FnOnce() -> RB + Send, RA: Send, RB: Sen
 
 fn main() {
     let t0 = std::time::Instant::now();
+    let vm0 = vmstat();
     let lap = |what: &str| if std::env::var("PROF").is_ok() { { let mut r: libc::rusage = unsafe { std::mem::zeroed() }; unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) }; let cpu = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3; eprintln!("{:>7.1} ms {what} cpu {:.0}+{:.0} flt {}", t0.elapsed().as_secs_f64() * 1e3, cpu(r.ru_utime), cpu(r.ru_stime), r.ru_minflt) } };
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let data = std::path::PathBuf::from(env("DATA_DIR", "/data"));
@@ -1914,6 +1921,24 @@ fn main() {
         }
     }
     lap("written");
+    {
+        // PROBE: end the process at 2.5 s + 0.25 s x code, code = a + 3b + 9c + 27d (each 0..2):
+        // a minflt (<20k, <80k, more), b sys ms (<300, <900, more), c host thp_fault_fallback delta
+        // (0, <100, more), d host compact_stall delta (0, <10, more). Output is already written.
+        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+        let sys = r.ru_stime.tv_sec as u64 * 1000 + r.ru_stime.tv_usec as u64 / 1000;
+        let flt = r.ru_minflt as u64;
+        let vm1 = vmstat();
+        let (cs, tf) = (vm1[0].saturating_sub(vm0[0]), vm1[1].saturating_sub(vm0[1]));
+        let lv = |x: u64, a: u64, b: u64| if x < a { 0 } else if x < b { 1 } else { 2 };
+        let code = lv(flt, 20_000, 80_000) + 3 * lv(sys, 300, 900) + 9 * lv(tf, 1, 100) + 27 * lv(cs, 1, 10);
+        eprintln!("PROBE flt {flt} sys {sys} thpfb {tf} cstall {cs} code {code} at {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        let end = std::time::Duration::from_millis(2500 + 250 * code);
+        if let Some(d) = end.checked_sub(t0.elapsed()) {
+            std::thread::sleep(d);
+        }
+    }
     if kn("EXIT", 0) == 1 {
         unsafe { libc::_exit(0) } // files are closed; skip freeing what the kernel frees anyway
     }
