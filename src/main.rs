@@ -1249,7 +1249,9 @@ fn main() {
         }
     }
     lap("keys");
-    if ech.len() >= 1024 || catnames.len() > 32 || cx.nb >= 1 << 23 {
+    // PROBE: which s16 fallback fires (1 chunks, 2 categories, 4 persons); 0 = a normal run
+    let fb = (ech.len() >= 1024) as u64 + 2 * (catnames.len() > 32) as u64 + 4 * (cx.nb >= 1 << 23) as u64;
+    if fb != 0 {
         cx.ek = None; // the 16 B slots do not fit: every event takes the exact bucket path
     }
     let cx = cx;
@@ -1929,6 +1931,12 @@ fn main() {
         }
     }
     lap("written");
+    if fb != 0 {
+        // pad the end to 2.5 s + 0.25 s x fb (output is already written)
+        if let Some(d) = std::time::Duration::from_millis(2500 + 250 * fb).checked_sub(t0.elapsed()) {
+            std::thread::sleep(d);
+        }
+    }
     if kn("EXIT", 0) == 1 {
         unsafe { libc::_exit(0) } // files are closed; skip freeing what the kernel frees anyway
     }
