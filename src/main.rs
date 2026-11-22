@@ -1978,7 +1978,11 @@ use std::sync::Arc;
 fn writer(path: &Path, schema: &str) -> SerializedFileWriter<std::fs::File> {
     let props = WriterProperties::builder()
         .set_dictionary_enabled(false)
-        .set_statistics_enabled(EnabledStatistics::None)
+        .set_statistics_enabled(EnabledStatistics::None);
+    // few distinct values: dictionary + RLE indices write a fraction of the bytes
+    let props = ["day", "sessions", "events", "top_category"]
+        .into_iter()
+        .fold(props, |p, c| p.set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from(c), true))
         .build();
     let schema = Arc::new(parquet::schema::parser::parse_message_type(schema).unwrap());
     SerializedFileWriter::new(std::fs::File::create(path).unwrap(), schema, Arc::new(props)).unwrap()
