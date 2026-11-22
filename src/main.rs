@@ -793,13 +793,17 @@ impl<T: Copy + Default> Wc<T> {
 /// The key doubles as a lock: a winner CASes in its key with bit L clear, writes the record, then
 /// stores the key with L set (x86 keeps stores in order, so the record is complete when L shows).
 struct Slots {
-    s: &'static [[std::sync::atomic::AtomicU64; 4]],
+    s: &'static [[std::sync::atomic::AtomicU64; 2]],
 }
-const L: u64 = 1 << 31; // set in every finished key: chunk numbers stay below 2^31
+const L: u64 = 1 << 31; // chunk numbers stay below 2^31
+// 16 B slot: w0 = !(ingest 23 | chunk 10) << 31 | user >> 3 << 1 | lock bit (set when finished),
+// w1 = ts << 32 | pc << 3 | user & 7; user = FAST bit 32 | number, or the user_id offset (slow).
+// main keeps the slot path only when chunks < 1024, categories <= 32 (pc < 2^29) and persons < 2^23.
+const IMAX: u64 = (1 << 23) - 2; // ingest clamp: any row at or past it is invalid (window + 1 day < 2^23 s)
 impl Slots {
     fn new(n: usize) -> Self {
         // fresh anonymous pages are zero: no fill, and the 2 MB faults run in parallel during phase 1
-        let b = (n.max(1) * 32).next_multiple_of(BIG);
+        let b = (n.max(1) * 16).next_multiple_of(BIG);
         unsafe {
             let p = libc::mmap(std::ptr::null_mut(), b, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
             assert!(p != libc::MAP_FAILED, "slots mmap");
@@ -816,20 +820,20 @@ impl Slots {
     fn put(&self, e: &Ev, ci: usize) {
         use std::sync::atomic::Ordering::*;
         let r = &self.s[e.eid as usize];
-        let s = !((e.ingest as u64) << 32 | ci as u64);
+        let u = if e.uh & FAST != 0 { 1 << 32 | (e.uh & 0xffff_ffff) } else { e.off as u64 };
+        let p = !((e.ingest as u64).min(IMAX) << 10 | ci as u64) & ((1 << 33) - 1); // never 0: ingest <= IMAX
+        let s = p << 31 | (u >> 3) << 1 | 1;
         loop {
             let old = r[0].load(Relaxed);
-            if old != 0 && old & L == 0 {
+            if old != 0 && old & 1 == 0 {
                 std::hint::spin_loop(); // another row is writing this slot
                 continue;
             }
-            if old >= s {
+            if old >> 31 >= p {
                 return;
             }
-            if r[0].compare_exchange_weak(old, s & !L, Acquire, Relaxed).is_ok() {
-                r[1].store(e.uh, Relaxed);
-                r[2].store(e.ts as u64 | (e.off as u64) << 32, Relaxed);
-                r[3].store(e.pc as u64, Relaxed);
+            if r[0].compare_exchange_weak(old, s & !1, Acquire, Relaxed).is_ok() {
+                r[1].store((e.ts as u64) << 32 | (e.pc as u64) << 3 | (u & 7), Relaxed);
                 r[0].store(s, Release);
                 return;
             }
@@ -839,15 +843,18 @@ impl Slots {
     #[inline(always)]
     fn win(&self, i: usize) -> Option<(u32, usize)> {
         let s = self.s[i][0].load(std::sync::atomic::Ordering::Relaxed);
-        (s != 0).then(|| ((!s >> 32) as u32, (!s & 0xffff_ffff) as usize))
+        let p = !(s >> 31) & ((1 << 33) - 1);
+        (s != 0).then(|| ((p >> 10) as u32, (p & 1023) as usize))
     }
-    /// The surviving row at index i as an Ev (eid and ingest left 0)
+    /// The surviving row at index i as an Ev (eid and ingest left 0; off 0 for a FAST user)
     #[inline(always)]
     fn get(&self, i: usize) -> Ev {
         use std::sync::atomic::Ordering::Relaxed;
         let r = &self.s[i];
-        let (u, t, p) = (r[1].load(Relaxed), r[2].load(Relaxed), r[3].load(Relaxed));
-        Ev { eid: 0, uh: u, ts: t as u32, ingest: 0, pc: p as u32, off: (t >> 32) as u32 }
+        let (a, b) = (r[0].load(Relaxed), r[1].load(Relaxed));
+        let u = (a >> 1 & ((1 << 30) - 1)) << 3 | (b & 7);
+        let (uh, off) = if u >> 32 != 0 { (FAST | (u & 0xffff_ffff), 0) } else { (0, u as u32) };
+        Ev { eid: 0, uh, ts: (b >> 32) as u32, ingest: 0, pc: (b >> 3 & ((1 << 29) - 1)) as u32, off }
     }
 }
 
@@ -1242,6 +1249,9 @@ fn main() {
         }
     }
     lap("keys");
+    if ech.len() >= 1024 || catnames.len() > 32 || cx.nb >= 1 << 23 {
+        cx.ek = None; // the 16 B slots do not fit: every event takes the exact bucket path
+    }
     let cx = cx;
     // decoded events go straight to their index slot; the rest (all events, without an event key) to s1
     assert!(ech.len() < L as usize);
@@ -1325,6 +1335,11 @@ fn main() {
             if let Some(r) = fkey(e.uh & !FAST) {
                 return r;
             }
+            // a slot keeps no offset for a FAST user: the ID decoded, so it is the canonical form of its number
+            let mut b = Vec::with_capacity(9);
+            dec::enc(b'u', e.uh & !FAST, cx.uk.unwrap(), &mut b);
+            let l = loc(b.leak());
+            return (person(hash(at(l))), l);
         }
         let l = uloc(ech[ci].0, e.off);
         (person(hash(at(l))), l)
@@ -2052,7 +2067,7 @@ fn slots_race() {
                 for r in 0..20000u32 {
                     let i = (r * 7 + ci as u32) % 64;
                     let g = (r * 2654435761u32 ^ ci as u32) % 1000 + 5;
-                    sl.put(&Ev { eid: i as u64, uh: g as u64 * 3, ts: g * 5, ingest: g, pc: g * 7, off: g * 11 }, ci);
+                    sl.put(&Ev { eid: i as u64, uh: if g % 2 == 1 { FAST | g as u64 * 3 } else { 0 }, ts: g * 5, ingest: g, pc: g * 7, off: g * 11 }, ci);
                 }
             });
         }
@@ -2070,6 +2085,7 @@ fn slots_race() {
         let (g, ci) = sl.win(i as usize).unwrap();
         assert_eq!((g, ci), best);
         let e = sl.get(i as usize);
-        assert_eq!((e.uh, e.ts, e.pc, e.off), (g as u64 * 3, g * 5, g * 7, g * 11));
+        let (uh, off) = if g % 2 == 1 { (FAST | g as u64 * 3, 0) } else { (0, g * 11) };
+        assert_eq!((e.uh, e.ts, e.pc, e.off), (uh, g * 5, g * 7, off));
     }
 }
